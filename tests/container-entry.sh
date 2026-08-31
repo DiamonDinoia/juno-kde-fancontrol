@@ -17,6 +17,7 @@ check() { # check NAME CMD...
 apt-get update -qq
 if ! apt-get install -y -qq --no-install-recommends \
     python3 python3-pyside6.qtwidgets python3-pytest fonts-dejavu-core \
+    fancontrol desktop-file-utils \
     libgl1 libegl1 libglib2.0-0t64 libfontconfig1 libfreetype6 libdbus-1-3 libxkbcommon0 \
     > /tmp/apt.log 2>&1; then
     echo "apt install failed:"; tail -5 /tmp/apt.log; exit 1
@@ -27,12 +28,23 @@ export PYTHON=python3
 # (helper found, Apply enabled). Runs as container root; fails loudly.
 install_out=$(bash "$SRC/install.sh" 2>&1) || { echo "install.sh failed:"; echo "$install_out"; exit 1; }
 
-check fancore-unit      "$PYTHON" -m pytest -q -p no:cacheprovider "$SRC/tests/test_fancore.py" "$SRC/tests/test_app_init.py"
+# The whole directory, never a list of files: a named list silently left
+# tests/test_ktheme.py out of the gate for a whole pass.
+check fancore-unit      "$PYTHON" -m pytest -q -p no:cacheprovider "$SRC/tests"
 check apply-helper      env PYTHON="$PYTHON" bash "$SRC/tests/test_apply_helper.sh"
 check deb-package       bash "$SRC/tests/test_deb.sh"
 check render-quiet      "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-quiet.png       --preset quiet
 check render-turbo-dark "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-turbo-dark.png  --preset turbo --dark
 check render-auto       "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-auto.png        --preset quiet --auto
+check render-knobs      "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-knobs.png \
+                            --knobs "40:0 55:60 70:90 80:150 95:255"
+check render-tray       "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray.png
+check render-tray-dark  "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-dark.png --dark
+check render-tray-off   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-off.png \
+                            --dgpu suspended --battery "Not charging"
+mkdir -p /out/control
+check render-control    "$PYTHON" "$SRC/tests/render_app.py"  --out /out/control/nochart.png --preset quiet --hide-chart
+check render-tray-ctl   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/control/tray-nochart.png --hide-chart
 
 echo
 echo "=== summary"
