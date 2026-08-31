@@ -1,0 +1,13 @@
+# Let the desktop read the RAPL energy counters.
+#
+# The kernel made /sys/class/powercap/*/energy_uj root-only (0400) after
+# PLATYPUS (CVE-2020-8694): the counter leaks enough about instruction-level
+# power draw to recover AES keys from an unprivileged process. Granting group
+# read restores per-user power monitoring and re-opens that side channel to
+# anyone in the group, so keep the group narrow.
+#
+# Install:
+#   sudo install -m644 /usr/share/juno-kde-fancontrol/rapl-readable.rules \
+#        /etc/udev/rules.d/99-rapl-readable.rules
+#   sudo udevadm control --reload && sudo udevadm trigger -s powercap
+SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/chmod g+r %S%p/energy_uj"

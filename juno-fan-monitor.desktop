@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Juno Fan Monitor
+GenericName=System Tray Monitor
+Comment=Tray readout of CPU/GPU temperature, fan speed, network, power and battery
+Exec=juno-fan-monitor
+Icon=preferences-system
+Categories=System;Monitor;Qt;
+Keywords=fan;temperature;gpu;network;battery;power;tray;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
