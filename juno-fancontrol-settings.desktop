@@ -1,0 +1,18 @@
+[Desktop Entry]
+# System Settings external module. systemsettings scans
+# $XDG_DATA_DIRS/plasma/systemsettings/externalmodules/*.desktop
+# (app/kcmmetadatahelpers.h: findExternalKCMModules) and reads Name, Icon,
+# Comment, Exec, the parent category and the weight from each one.
+# There is no type filter in that loader, and desktop-file-validate rejects
+# Exec= under Type=Service, so Type=Application satisfies both.
+Type=Application
+NoDisplay=true
+Name=Fan Control
+Comment=Fan curve, presets and the EC automatic mode for this laptop
+Icon=preferences-system-power-management
+Exec=juno-kde-fancontrol
+# Power Management sits in this category, and a fan curve is the same kind of
+# setting. hardware ("Connected Devices") holds per-peripheral panels instead.
+X-KDE-System-Settings-Parent-Category=system-administration
+X-KDE-Weight=75
+X-KDE-Keywords=fan,fans,fan curve,fancontrol,cooling,thermal,noise,pwm,rpm,temperature,quiet,turbo,clevo,juno

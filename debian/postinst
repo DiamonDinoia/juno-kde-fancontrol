@@ -1,19 +1,36 @@
 #!/bin/bash
 set -e
 
-# Custom (non-preset) curves survive restarts only if fan-profile's regen
-# keeps unknown labels instead of failing the ExecStartPre chain. The deb
-# does not own /usr/local/bin/fan-profile (it comes from the juno system
-# fixes), so warn instead of touching it.
-if [[ -x /usr/local/bin/fan-profile ]] && ! grep -q regen_custom /usr/local/bin/fan-profile; then
+# The package now owns the whole fan stack under /usr. Machines set up before
+# it exist still carry hand-installed copies under /usr/local, which win on
+# PATH, and drop-ins under /etc/systemd/system, which win over /usr/lib for
+# the same filename. Neither is dpkg's to delete, so report both and let the
+# admin decide.
+if [ -e /usr/local/bin/fan-profile ] && \
+   ! cmp -s /usr/local/bin/fan-profile /usr/bin/fan-profile; then
     cat >&2 <<'EOF'
-juno-kde-fancontrol: WARNING
-  /usr/local/bin/fan-profile is the pre-fix version: its `regen` ExecStartPre
-  hook rejects non-preset labels, so custom curves from this GUI would roll
-  back at every service restart. Update it once with:
-    sudo install -m755 ~/system-fixes/fan-profile /usr/local/bin/fan-profile
-  (preset buttons Quiet/Balanced/Cool/Turbo work regardless.)
+juno-kde-fancontrol: NOTE
+  /usr/local/bin/fan-profile differs from the packaged /usr/bin/fan-profile
+  and shadows it on PATH. The packaged systemd drop-in calls /usr/bin
+  explicitly, so the CLI and the boot-time regen would run different code.
+  Remove the old copy once you are happy with this package:
+    sudo rm /usr/local/bin/fan-profile /usr/local/bin/fan-calibrate
 EOF
+fi
+
+if [ -d /run/systemd/system ]; then
+    # A failed reload must not abort the install, but it must not vanish either.
+    systemctl daemon-reload \
+        || echo "juno-kde-fancontrol: systemctl daemon-reload failed" >&2
+    # A drop-in only takes effect on the next start. Restarting a fan
+    # controller is the admin's call, not the installer's.
+    if systemctl is-active --quiet fancontrol.service; then
+        cat >&2 <<'EOF'
+juno-kde-fancontrol: fancontrol.service is running with its previous config.
+  Pick up the packaged drop-in with:
+    sudo systemctl restart fancontrol.service
+EOF
+    fi
 fi
 
 #DEBHELPER#
