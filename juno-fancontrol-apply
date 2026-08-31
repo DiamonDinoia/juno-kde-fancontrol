@@ -10,6 +10,12 @@
 #   juno-fancontrol-apply --auto                        # hand fans to the EC
 #   juno-fancontrol-apply [--ignore-cap] INTERVAL MINTEMP MAXTEMP MINSTART \
 #                         MINSTOP MINPWM MAXPWM AVERAGE LABEL
+#   juno-fancontrol-apply --knobs "T:P T:P ..." <the same 9 args>
+#
+# --knobs writes a multi-point curve. fancontrol interpolates only one linear
+# segment, so the knobs go in a `# Knobs:` comment, FCTEMPS points at the
+# executable juno-fan-curve source, and the 9 positionals carry the fixed
+# transfer calibration (fancore.KNOB_XFER) rather than a curve.
 #
 # Test hooks (pkexec scrubs the environment, so these never leak into
 # production use): JFC_PLATFORM_DIR JFC_FANCONFIG JFC_CAP_FILE JFC_SYSTEMCTL
@@ -21,19 +27,42 @@ FANCONFIG="${JFC_FANCONFIG:-/etc/fancontrol}"
 CAP_FILE="${JFC_CAP_FILE:-/etc/fan-profile.maxpwm}"
 SYSTEMCTL="${JFC_SYSTEMCTL:-systemctl}"
 FANCONTROL="${JFC_FANCONTROL:-/usr/sbin/fancontrol}"
-FAN_PROFILE="${JFC_FAN_PROFILE:-/usr/local/bin/fan-profile}"
+# /usr/bin is where the package puts fan-profile; /usr/local/bin is the legacy
+# hand-installed location, still present on machines predating the package.
+FAN_PROFILE="${JFC_FAN_PROFILE:-}"
+if [[ -z "$FAN_PROFILE" ]]; then
+    for _fp in /usr/bin/fan-profile /usr/local/bin/fan-profile; do
+        [[ -x "$_fp" ]] && FAN_PROFILE=$_fp && break
+    done
+    FAN_PROFILE=${FAN_PROFILE:-/usr/bin/fan-profile}
+fi
+FAN_CURVE="${JFC_FAN_CURVE:-}"
+if [[ -z "$FAN_CURVE" ]]; then
+    for _fc in /usr/bin/juno-fan-curve /usr/local/bin/juno-fan-curve; do
+        [[ -x "$_fc" ]] && FAN_CURVE=$_fc && break
+    done
+    FAN_CURVE=${FAN_CURVE:-/usr/bin/juno-fan-curve}
+fi
 NOW="${JFC_NOW:-$(date '+%Y-%m-%d %H:%M')}"
+MAX_KNOBS=16   # keep in step with fancore.MAX_KNOBS
 
 die() { echo "juno-fancontrol-apply: $*" >&2; exit 1; }
 
 usage() {
     echo "usage: juno-fancontrol-apply --auto" >&2
-    echo "   or: juno-fancontrol-apply [--ignore-cap] INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM AVERAGE LABEL" >&2
+    echo "   or: juno-fancontrol-apply [--ignore-cap] [--knobs \"T:P T:P ...\"] INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM AVERAGE LABEL" >&2
     exit 64
 }
 
 IGNORE_CAP=0
-[[ "${1:-}" == "--ignore-cap" ]] && { IGNORE_CAP=1; shift; }
+KNOBS=""
+while true; do
+    case "${1:-}" in
+        --ignore-cap) IGNORE_CAP=1; shift ;;
+        --knobs)      KNOBS="${2:-}"; shift 2 ;;
+        *)            break ;;
+    esac
+done
 
 if [[ "${1:-}" == "--auto" ]]; then
     exec "$FAN_PROFILE" auto
@@ -51,9 +80,38 @@ done
 (( MINTEMP < MAXTEMP ))               || die "MINTEMP ($MINTEMP) must be < MAXTEMP ($MAXTEMP)"
 (( MINPWM <= MINSTOP ))               || die "MINPWM ($MINPWM) must be <= MINSTOP ($MINSTOP)"
 (( MINSTOP < MAXPWM ))                || die "MINSTOP ($MINSTOP) must be < MAXPWM ($MAXPWM)"
+(( MINSTART >= MINSTOP ))             || die "MINSTART ($MINSTART) must be >= MINSTOP ($MINSTOP)"
 (( MINSTART <= 255 && MINSTOP <= 255 && MAXPWM <= 255 )) || die "pwm values must be <= 255"
 (( AVERAGE >= 1 && AVERAGE <= 16 ))   || die "AVERAGE must be 1..16"
 [[ "$LABEL" =~ ^[a-z0-9-]+$ ]]        || die "bad label '$LABEL'"
+
+# --- validate the knob list (same rules as fancore.Curve._validate_knobs) ---
+# This runs as root on caller-supplied argv, so it re-checks everything the GUI
+# already checked rather than trusting it.
+KNOB_T=(); KNOB_P=()
+if [[ -n "$KNOBS" ]]; then
+    for kv in $KNOBS; do   # unquoted on purpose: split, then validate each token
+        [[ "$kv" =~ ^([0-9]+):([0-9]+)$ ]] || die "bad knob '$kv', want TEMP:PWM"
+        KNOB_T+=("${BASH_REMATCH[1]}"); KNOB_P+=("${BASH_REMATCH[2]}")
+    done
+    n=${#KNOB_T[@]}
+    (( n >= 2 ))          || die "a knob curve needs at least 2 knobs, got $n"
+    (( n <= MAX_KNOBS ))  || die "at most $MAX_KNOBS knobs, got $n"
+    for ((i = 0; i < n; i++)); do
+        (( KNOB_T[i] <= 130 )) || die "knob temperature must be 0..130 C, got ${KNOB_T[i]}"
+        (( KNOB_P[i] <= 255 )) || die "knob pwm must be 0..255, got ${KNOB_P[i]}"
+        (( i == 0 )) && continue
+        (( KNOB_T[i] > KNOB_T[i-1] ))  || die "knob temperatures must ascend, got ${KNOB_T[i-1]} then ${KNOB_T[i]}"
+        # A fan curve that falls with temperature cools less as the CPU heats.
+        (( KNOB_P[i] >= KNOB_P[i-1] )) || die "knob pwm must not fall, got ${KNOB_P[i-1]} then ${KNOB_P[i]}"
+    done
+    [[ -x "$FAN_CURVE" ]] || die "knob curves need $FAN_CURVE, which is missing or not executable"
+    # The cap-exempt profile is turbo, a native preset that `fan-profile regen`
+    # replays from its own table. A knob curve is only ever a custom label, and
+    # regen re-applies the cap to its knobs at every boot, so accepting
+    # --ignore-cap here would hold only until the next reboot.
+    (( IGNORE_CAP == 0 )) || die "--knobs and --ignore-cap are mutually exclusive: a knob curve always honors the calibrated cap"
+fi
 
 # --- resolve hwmon indices fresh (they drift between boots — never cache hwmonN) ---
 resolve_hw() {
@@ -72,13 +130,25 @@ done
 ((${#PWMS[@]} >= 1)) || die "$FANHW exposes no pwmN files"
 
 # fancontrol sanitizes device names (sed 's/[[:space:]=]/_/g') before matching
-# DEVNAME — emit the same form.
+# DEVNAME — emit the same form. Both names come from sysfs, like
+# fancore.render_config: a hardcoded name is a config fancontrol silently
+# rejects on any board that reports a different one.
 FAN_DEVNAME=$(sed 's/[[:space:]=]/_/g' < "$HWMON_DIR/name")
+TEMP_DEVNAME=$(sed 's/[[:space:]=]/_/g' < "$PLATFORM_DIR/coretemp.0/hwmon/$TEMPHW/name")
 
 # --- calibrated noise cap (fan-profile semantics: everything but turbo honors it) ---
 if [[ "$IGNORE_CAP" != 1 && -f "$CAP_FILE" ]]; then
     CAP=$(tr -dc '0-9' < "$CAP_FILE")
-    if [[ -n "$CAP" ]] && (( MAXPWM > CAP )); then
+    if [[ -n "$CAP" && -n "$KNOBS" ]]; then
+        # In knob mode MAXPWM is the transfer calibration, so the cap has to
+        # land on the knobs themselves. Clamping preserves the non-falling
+        # order the validation above enforced.
+        clamped=0
+        for ((i = 0; i < ${#KNOB_P[@]}; i++)); do
+            if (( KNOB_P[i] > CAP )); then KNOB_P[i]=$CAP; clamped=1; fi
+        done
+        if (( clamped )); then echo "clamping knob pwm to <= $CAP (calibrated noise cap)"; fi
+    elif [[ -n "$CAP" ]] && (( MAXPWM > CAP )); then
         echo "clamping MAXPWM $MAXPWM -> $CAP (calibrated noise cap)"
         MAXPWM="$CAP"
     fi
@@ -96,18 +166,36 @@ pair() { # pair KEY VALUE -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=VALUE ..."
 
 FCTEMPS=(); FCFANS=()
 for pwm in "${PWMS[@]}"; do
-    FCTEMPS+=("$FANHW/$pwm=$TEMPHW/temp1_input")
+    if [[ -n "$KNOBS" ]]; then
+        FCTEMPS+=("$FANHW/$pwm=!$FAN_CURVE")
+    else
+        FCTEMPS+=("$FANHW/$pwm=$TEMPHW/temp1_input")
+    fi
     FCFANS+=("$FANHW/$pwm=$FANHW/fan${pwm#pwm}_input")
 done
+
+KNOB_LINE=""
+if [[ -n "$KNOBS" ]]; then
+    KNOB_LINE="# Knobs:"
+    for ((i = 0; i < ${#KNOB_T[@]}; i++)); do
+        KNOB_LINE+=" ${KNOB_T[i]}:${KNOB_P[i]}"
+    done
+fi
 
 TMP="${FANCONFIG}.tmp.$$"
 trap 'rm -f "$TMP"' EXIT
 {
     echo "# Managed by fan-profile ($LABEL) — $NOW"
-    echo "# Edit MIN/MAX values then run: fancontrol or fan-profile $HINT"
+    if [[ -n "$KNOB_LINE" ]]; then
+        echo "$KNOB_LINE"
+        echo "# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX"
+        echo "# values below are the fixed transfer calibration, not the curve."
+    else
+        echo "# Edit MIN/MAX values then run: fancontrol or fan-profile $HINT"
+    fi
     echo "INTERVAL=$INTERVAL"
     echo "DEVPATH=$FANHW=devices/platform/clevofan $TEMPHW=devices/platform/coretemp.0"
-    echo "DEVNAME=$FANHW=$FAN_DEVNAME $TEMPHW=coretemp"
+    echo "DEVNAME=$FANHW=$FAN_DEVNAME $TEMPHW=$TEMP_DEVNAME"
     echo "FCTEMPS=$(join_by "${FCTEMPS[@]}")"
     echo "FCFANS=$(join_by "${FCFANS[@]}")"
     pair MINTEMP "$MINTEMP"
@@ -138,7 +226,11 @@ restore() {
 "$FANCONTROL" --check "$FANCONFIG" >/dev/null 2>&1 \
     || restore "fancontrol --check rejected the new config"
 
-echo "wrote $FANCONFIG ($LABEL): ${MINTEMP}C..${MAXTEMP}C pwm ${MINPWM}..${MAXPWM} on $FANHW/$TEMPHW (${#PWMS[@]} fan(s))"
+if [[ -n "$KNOBS" ]]; then
+    echo "wrote $FANCONFIG ($LABEL): ${#KNOB_T[@]} knobs${KNOB_LINE#\# Knobs:} on $FANHW via $FAN_CURVE (${#PWMS[@]} fan(s))"
+else
+    echo "wrote $FANCONFIG ($LABEL): ${MINTEMP}C..${MAXTEMP}C pwm ${MINPWM}..${MAXPWM} on $FANHW/$TEMPHW (${#PWMS[@]} fan(s))"
+fi
 
 # --- (re)start the daemon (NO_RESTART: fan-profile regen semantics) ---
 if [[ "${NO_RESTART:-0}" != "1" ]]; then

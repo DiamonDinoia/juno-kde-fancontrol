@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# fan-calibrate — measure fan noise vs PWM using the laptop microphone and
+# recommend a "reasonable" MAXPWM cap for the non-turbo fan-profile curves.
+#
+# Method: temporarily take manual control of the fan, sweep PWM levels, and at
+# each level record a few seconds from the mic and compute A-WEIGHTED loudness
+# (models perceived loudness; de-emphasizes the sub-200 Hz rumble that otherwise
+# swamps broadband RMS). The mic gain is boosted to 100% for the sweep (and
+# restored) because at the default ~40% the fan sits under the preamp noise.
+#
+# The cap is the loudest level whose A-weighted loudness is within THRESH_DB of
+# the quietest fan-on level. The sweep also logs RPM; if the mic can't separate
+# levels (audio range < MIN_RANGE_DB) it FALLS BACK to an RPM-based cap, since
+# RPM rises monotonically with noise. `--apply` writes /etc/fan-profile.maxpwm.
+#
+# Run in a QUIET room, don't type during the ~1-minute sweep. The fan WILL get
+# loud near the top — that's expected. Run as your normal user (NOT sudo) so
+# pw-record has your PipeWire session; pwm writes escalate via sudo internally.
+set -euo pipefail
+
+LEVELS=(${LEVELS:-60 90 120 150 180 210 255})
+SETTLE=${SETTLE:-5}          # seconds for the fan to reach the target speed
+REC=${REC:-4}               # seconds of audio per level
+THRESH_DB=${THRESH_DB:-12}   # cap = loudest level within +THRESH_DB of fan floor
+MIN_RANGE_DB=${MIN_RANGE_DB:-6} # below this audio span -> fall back to RPM
+RPM_FRAC=${RPM_FRAC:-0.65}   # RPM-fallback cap target = RPM_FRAC * max RPM
+CAP_FILE=/etc/fan-profile.maxpwm
+CLEVO_GLOB="/sys/devices/platform/clevofan/hwmon/hwmon*"
+APPLY=0
+[[ "${1:-}" == "--apply" ]] && APPLY=1
+
+command -v pw-record >/dev/null || { echo "need pw-record (pipewire)"; exit 1; }
+command -v pactl >/dev/null     || { echo "need pactl";              exit 1; }
+python3 -c 'import numpy' 2>/dev/null || { echo "need python3 + numpy"; exit 1; }
+
+priv() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+setfile() { printf '%s\n' "$2" | priv tee "$1" >/dev/null; }
+
+HWMON=$(echo $CLEVO_GLOB)
+[[ -d "$HWMON" ]] || { echo "clevofan hwmon not found"; exit 1; }
+PWM1="$HWMON/pwm1"; PWM2="$HWMON/pwm2"
+EN1="$HWMON/pwm1_enable"; EN2="$HWMON/pwm2_enable"; RPM1="$HWMON/fan1_input"
+
+FANCTL_WAS=$(systemctl is-active fancontrol 2>/dev/null || true)
+MIC_VOL_ORIG=$(pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oP '\d+(?=%)' | head -1 || echo 40)
+
+restore() {
+    echo; echo "Restoring fan control and mic gain..."
+    pactl set-source-volume @DEFAULT_SOURCE@ "${MIC_VOL_ORIG}%" 2>/dev/null || true
+    if [[ "$FANCTL_WAS" == "active" ]]; then
+        priv systemctl start fancontrol.service 2>/dev/null || true
+    else
+        setfile "$EN1" 2 2>/dev/null || true; setfile "$EN2" 2 2>/dev/null || true
+    fi
+}
+trap restore EXIT INT TERM
+
+# A-weighted loudness (dB, relative) of a wav, DC removed.
+measure_db() {
+    python3 - "$1" <<'PY'
+import wave, math, numpy as np, sys
+try:
+    w=wave.open(sys.argv[1]); sr=w.getframerate()
+    a=np.frombuffer(w.readframes(w.getnframes()),dtype=np.int16).astype(np.float64)
+    if a.size==0: print("nan"); raise SystemExit
+    a-=a.mean()
+    N=a.size; mag=np.abs(np.fft.rfft(a*np.hanning(N)))*2/N
+    fq=np.fft.rfftfreq(N,1/sr); fq=np.maximum(fq,1e-6)
+    ra=(12194**2*fq**4)/((fq**2+20.6**2)*np.sqrt((fq**2+107.7**2)*(fq**2+737.9**2))*(fq**2+12194**2))
+    aw=mag*ra*10**(1.9997/20)
+    print(f"{20*math.log10(np.sqrt(np.sum(aw**2))+1e-9):.1f}")
+except SystemExit: pass
+except Exception: print("nan")
+PY
+}
+
+echo "fan-calibrate: sweeping PWM ${LEVELS[*]}  (settle ${SETTLE}s, record ${REC}s each)"
+echo "Stay quiet — measuring A-weighted mic loudness per level. Fan will spin up."
+echo
+
+pactl set-source-volume @DEFAULT_SOURCE@ 100% 2>/dev/null || true
+priv systemctl stop fancontrol.service 2>/dev/null || true
+setfile "$EN1" 1; setfile "$EN2" 1
+
+declare -a R_LVL R_RPM R_DB
+printf "%6s  %8s  %10s\n" "PWM" "RPM" "loudnessA"
+for lvl in "${LEVELS[@]}"; do
+    setfile "$PWM1" "$lvl"; setfile "$PWM2" "$lvl"
+    sleep "$SETTLE"
+    rpm=$(cat "$RPM1" 2>/dev/null || echo 0)
+    wav=$(mktemp --suffix=.wav)
+    timeout "$REC" pw-record --channels=1 --rate=16000 "$wav" 2>/dev/null || true
+    db=$(measure_db "$wav"); rm -f "$wav"
+    R_LVL+=("$lvl"); R_RPM+=("$rpm"); R_DB+=("$db")
+    printf "%6s  %8s  %10s\n" "$lvl" "$rpm" "$db"
+done
+
+LV_CSV=$(IFS=,; echo "${R_LVL[*]}")
+RPM_CSV=$(IFS=,; echo "${R_RPM[*]}")
+DB_CSV=$(IFS=,; echo "${R_DB[*]}")
+read -r CAP METHOD <<<"$(python3 - "$THRESH_DB" "$MIN_RANGE_DB" "$RPM_FRAC" "$LV_CSV" "$RPM_CSV" "$DB_CSV" <<'PY'
+import sys
+nan=float('nan')
+thr,minr,frac=float(sys.argv[1]),float(sys.argv[2]),float(sys.argv[3])
+lv=[float(x) for x in sys.argv[4].split(',')]
+rpm=[float(x) for x in sys.argv[5].split(',')]
+db=[float(x) for x in sys.argv[6].split(',')]
+A=[(l,d,r) for l,d,r in zip(lv,db,rpm) if d==d]  # drop nan
+if A and (max(d for _,d,_ in A)-min(d for _,d,_ in A))>=minr:
+    floor=min(d for _,d,_ in A); ok=[l for l,d,_ in A if d<=floor+thr]
+    print(int(max(ok) if ok else min(l for l,_,_ in A)), "audio")
+else:
+    P=[(l,r) for l,r in zip(lv,rpm)]
+    maxr=max(r for _,r in P) or 1; tgt=frac*maxr
+    ok=[l for l,r in P if r<=tgt]
+    print(int(max(ok) if ok else min(l for l,_ in P)), "rpm")
+PY
+)"
+
+echo
+if [[ "$METHOD" == "audio" ]]; then
+    echo "Recommended non-turbo MAXPWM cap: $CAP  (loudest level within +${THRESH_DB} dB(A) of the quietest fan level)"
+else
+    echo "Mic could not separate levels (range < ${MIN_RANGE_DB} dB) — fell back to RPM."
+    echo "Recommended non-turbo MAXPWM cap: $CAP  (RPM <= ${RPM_FRAC} x max RPM)"
+fi
+
+if [[ "$APPLY" == "1" ]]; then
+    setfile "$CAP_FILE" "$CAP"
+    echo "Wrote $CAP_FILE = $CAP"
+    cur=$(grep -m1 '^# Managed by fan-profile' /etc/fancontrol 2>/dev/null | sed 's/.*(//; s/).*//')
+    [[ -z "$cur" || "$cur" == "turbo" ]] && cur=balanced
+    echo "Re-applying current profile: $cur"
+    trap - EXIT INT TERM
+    pactl set-source-volume @DEFAULT_SOURCE@ "${MIC_VOL_ORIG}%" 2>/dev/null || true
+    priv fan-profile "$cur"          # /usr/bin (package) or /usr/local/bin (legacy), both on sudo secure_path
+else
+    echo "Re-run with --apply to write the cap and re-apply your profile."
+fi

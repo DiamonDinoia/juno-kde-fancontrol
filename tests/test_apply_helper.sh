@@ -20,8 +20,8 @@ make_tree() { # make_tree N_FANS
     local n="${1:-2}" i
     rm -rf "$ROOT/sys"
     mkdir -p "$ROOT/sys/clevofan/hwmon/hwmon7" "$ROOT/sys/coretemp.0/hwmon/hwmon10"
-    echo "V5xTNC_TND_TNE" > "$ROOT/sys/clevofan/hwmon/hwmon7/name"
-    echo "coretemp" > "$ROOT/sys/coretemp.0/hwmon/hwmon10/name"
+    echo "${FAN_NAME:-V5xTNC_TND_TNE}" > "$ROOT/sys/clevofan/hwmon/hwmon7/name"
+    echo "${TEMP_NAME:-coretemp}" > "$ROOT/sys/coretemp.0/hwmon/hwmon10/name"
     echo "74000" > "$ROOT/sys/coretemp.0/hwmon/hwmon10/temp1_input"
     for ((i = 1; i <= n; i++)); do
         echo 78 > "$ROOT/sys/clevofan/hwmon/hwmon7/pwm$i"
@@ -69,19 +69,27 @@ echo 150 > "$ROOT/etc/fan-profile.maxpwm"
 
 # The REAL fan-profile under test (defaults to the patched source of truth);
 # fpwrap hands it the fake tree/config.
-FP_LIVE="${FANPROFILE:-$HOME/system-fixes/fan-profile}"
+FP_LIVE="${FANPROFILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/fan-profile}"
 [[ -f "$FP_LIVE" ]] || { echo "FANPROFILE not found: $FP_LIVE" >&2; exit 1; }
-cat > "$ROOT/bin/fpwrap" <<EOF
+real_fpwrap() {
+    cat > "$ROOT/bin/fpwrap" <<EOF
 #!/bin/bash
 exec env FP_AS_ROOT=1 FP_SYSFS="$ROOT/sys" FP_FANCONFIG="$ROOT/etc/fancontrol" \
          FP_CAP_FILE="$ROOT/etc/fan-profile.maxpwm" "$FP_LIVE" "\$@"
 EOF
-chmod +x "$ROOT/bin/fpwrap"
+    chmod +x "$ROOT/bin/fpwrap"
+}
+real_fpwrap
 
 export JFC_PLATFORM_DIR="$ROOT/sys" JFC_FANCONFIG="$ROOT/etc/fancontrol" \
        JFC_CAP_FILE="$ROOT/etc/fan-profile.maxpwm" JFC_SYSTEMCTL="$ROOT/bin/systemctl" \
        JFC_FANCONTROL="$ROOT/bin/fancontrol" JFC_FAN_PROFILE="$ROOT/bin/fan-profile" \
        JFC_NOW="2026-08-31 07:35"
+# Knob mode needs an executable FCTEMPS source. The real one is python; a stub
+# is enough here because nothing in this suite evaluates the curve.
+printf '#!/bin/sh\necho 74000\n' > "$ROOT/bin/juno-fan-curve"
+chmod +x "$ROOT/bin/juno-fan-curve"
+export JFC_FAN_CURVE="$ROOT/bin/juno-fan-curve"
 APPLY="${APPLY:-$SRC/juno-fancontrol-apply}"   # APPLY env: test the packaged helper
 
 reset_state() {
@@ -195,6 +203,201 @@ out=$("$APPLY" 12 58 90 65 55 20 100 4 custom 2>&1); rc=$?
 grep -q "(quiet)" "$ROOT/etc/fancontrol" && ok T10-rolled-back || bad T10-rolled-back "$(head -1 "$ROOT/etc/fancontrol")"
 grep -q "^start fancontrol.service" "$ROOT/state/systemctl.log" \
     && ok T10-daemon-restarted || bad T10-daemon-restarted "$(cat "$ROOT/state/systemctl.log")"
+
+# T11: a config missing one key must leave regen a no-op. A concatenated -z
+# guard let this through and wrote "MINSTART=hwmon7/pwm1=", which
+# fancontrol --check accepts and the daemon then reads as 0 (no kick-start).
+make_tree 2; reset_state; real_fpwrap
+"$APPLY" 12 58 90 65 55 20 100 4 custom >/dev/null 2>&1
+sed -i '/^MINSTART=/d' "$ROOT/etc/fancontrol"
+before=$(md5sum < "$ROOT/etc/fancontrol")
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T11-partial-regen-survives || bad T11-partial-regen-survives "rc=$rc $out"
+[[ "$before" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T11-partial-config-untouched || bad T11-partial-config-untouched "$(grep '^MINSTART=' "$ROOT/etc/fancontrol")"
+grep -q "cannot parse values" <<< "$out" && ok T11-partial-warns || bad T11-partial-warns "$out"
+
+# T12: one-fan machine, full restart path. The regen replay rewrites the config
+# from the live pwm count, so a hardcoded pwm1+pwm2 emit would resurrect pwm2
+# here and fancontrol --check would then fail on a device that does not exist.
+make_tree 1; reset_state; real_fpwrap
+out=$("$APPLY" 12 58 90 65 55 20 100 4 custom 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T12-one-fan-custom || bad T12-one-fan-custom "$out"
+grep -q pwm2 "$ROOT/etc/fancontrol" && bad T12-one-fan-regen "pwm2 resurrected by regen" || ok T12-one-fan-regen
+grep -qx "MINSTART=hwmon7/pwm1=65" "$ROOT/etc/fancontrol" \
+    && ok T12-one-fan-values || bad T12-one-fan-values "$(grep '^MINSTART=' "$ROOT/etc/fancontrol")"
+
+# reference text as backend.fancore.render_config emits it for a knob curve
+render_knob_ref() { # render_knob_ref "T:P T:P ..."
+    "$PY" - "$ROOT/sys" "$1" "$SRC" "$JFC_FAN_CURVE" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[3])
+from backend.fancore import Curve, discover, render_config
+knobs = tuple(tuple(map(int, kv.split(":"))) for kv in sys.argv[2].split())
+c = Curve(interval=10, minstart=70, average=4, label="custom", knobs=knobs)
+c.validate()
+sys.stdout.write(render_config(c, discover(sys.argv[1]), "2026-08-31 07:35",
+                               fan_curve=sys.argv[4]))
+PYEOF
+}
+
+# The transfer calibration the GUI sends as positionals in knob mode
+# (fancore.KNOB_XFER): INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM
+# AVERAGE LABEL.
+XFER=(10 0 255 70 0 0 255 4 custom)
+KN="45:0 60:55 75:110 95:130"
+
+# T13: knob mode writes the knob list, the executable temp source and the
+# transfer constants, byte-identical to what fancore.render_config emits.
+# NO_RESTART: the restart replays `fan-profile regen`, which stamps a fresh
+# date into line 1 and would defeat a byte-exact comparison. T14 covers the
+# restart path.
+make_tree 2; reset_state; real_fpwrap
+out=$(NO_RESTART=1 "$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T13-knob-apply || bad T13-knob-apply "rc=$rc $out"
+diff <(render_knob_ref "$KN") "$ROOT/etc/fancontrol" >/dev/null \
+    && ok T13-knob-byte-exact \
+    || bad T13-knob-byte-exact "$(diff <(render_knob_ref "$KN") "$ROOT/etc/fancontrol" | head -6)"
+grep -qx "# Knobs: $KN" "$ROOT/etc/fancontrol" \
+    && ok T13-knob-line || bad T13-knob-line "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+grep -q "^FCTEMPS=hwmon7/pwm1=!$JFC_FAN_CURVE " "$ROOT/etc/fancontrol" \
+    && ok T13-knob-fctemps || bad T13-knob-fctemps "$(grep '^FCTEMPS=' "$ROOT/etc/fancontrol")"
+grep -q "temp1_input" "$ROOT/etc/fancontrol" \
+    && bad T13-knob-no-hwmon-temp "FCTEMPS still reads a hwmon temp input" \
+    || ok T13-knob-no-hwmon-temp
+
+# T14: the boot contract. The fake systemctl restart replays the REAL
+# `fan-profile regen`, so this pins that a reboot does not rewrite the transfer
+# calibration. Clamping MAXPWM to the 150 noise cap here would rescale every
+# commanded pwm by 150/255 -- a silently 41% slower fan.
+make_tree 2; reset_state; real_fpwrap
+out=$("$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T14-knob-apply-restart || bad T14-knob-apply-restart "rc=$rc $out"
+grep -qx "MAXPWM=hwmon7/pwm1=255 hwmon7/pwm2=255" "$ROOT/etc/fancontrol" \
+    && ok T14-knob-xfer-survived-regen \
+    || bad T14-knob-xfer-survived-regen "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
+before=$(md5sum < "$ROOT/etc/fancontrol")
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T14-knob-regen-ok || bad T14-knob-regen-ok "rc=$rc $out"
+[[ "$before" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T14-knob-regen-idempotent \
+    || bad T14-knob-regen-idempotent "$(diff <(render_knob_ref "$KN") "$ROOT/etc/fancontrol" | head -6)"
+
+# T14b: same config after an index drift -- knobs kept, fan hwmon refreshed.
+mv "$ROOT/sys/clevofan/hwmon/hwmon7" "$ROOT/sys/clevofan/hwmon/hwmon4"
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T14b-drift-regen-ok || bad T14b-drift-regen-ok "rc=$rc $out"
+grep -qx "# Knobs: $KN" "$ROOT/etc/fancontrol" \
+    && ok T14b-drift-keeps-knobs || bad T14b-drift-keeps-knobs "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+grep -q "^FCTEMPS=hwmon4/pwm1=!$JFC_FAN_CURVE " "$ROOT/etc/fancontrol" \
+    && ok T14b-drift-refreshes-index || bad T14b-drift-refreshes-index "$(grep '^FCTEMPS=' "$ROOT/etc/fancontrol")"
+mv "$ROOT/sys/clevofan/hwmon/hwmon4" "$ROOT/sys/clevofan/hwmon/hwmon7"
+
+# T15: the helper runs as root on caller-supplied argv, so every malformed knob
+# list must be refused BEFORE the config is written.
+for spec in "45:0" "45:0 60:55 40:90" "45:200 60:55" "45:0 60:x" "45:0 60:300" \
+            "45:0 60:55 75:110 95:130 100:140 105:150 110:160 115:170 120:180 \
+             121:190 122:200 123:210 124:220 125:230 126:240 127:250 128:255"; do
+    make_tree 2; reset_state; real_fpwrap
+    "$APPLY" --knobs "$KN" "${XFER[@]}" >/dev/null 2>&1
+    keep=$(md5sum < "$ROOT/etc/fancontrol")
+    out=$("$APPLY" --knobs "$spec" "${XFER[@]}" 2>&1); rc=$?
+    tag="T15-reject[${spec:0:14}]"
+    [[ $rc -ne 0 ]] && ok "$tag" || bad "$tag" "accepted: $out"
+    [[ "$keep" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+        && ok "$tag-untouched" || bad "$tag-untouched" "config rewritten by a rejected apply"
+done
+
+# T16: the calibrated cap (150) has to land on the knob pwms, because in knob
+# mode MAXPWM is the transfer constant and clamping it would do nothing.
+make_tree 2; reset_state; real_fpwrap
+out=$("$APPLY" --knobs "45:0 60:100 95:255" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T16-cap-apply || bad T16-cap-apply "rc=$rc $out"
+grep -qx "# Knobs: 45:0 60:100 95:150" "$ROOT/etc/fancontrol" \
+    && ok T16-cap-clamps-knobs || bad T16-cap-clamps-knobs "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+grep -qx "MAXPWM=hwmon7/pwm1=255 hwmon7/pwm2=255" "$ROOT/etc/fancontrol" \
+    && ok T16-cap-leaves-xfer || bad T16-cap-leaves-xfer "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
+
+# T17: --ignore-cap cannot be honored for a knob curve -- regen re-applies the
+# cap to the knobs at every boot -- so the combination is refused rather than
+# accepted and then silently undone. Both option orders must reach the check.
+# The knob list is one argument, so each order needs its own array: an
+# unquoted string would split "45:0 60:55 ..." across argv.
+knobs_first=(--knobs "$KN" --ignore-cap)
+cap_first=(--ignore-cap --knobs "$KN")
+for tag in knobs-first cap-first; do
+    case "$tag" in knobs-first) opts=("${knobs_first[@]}") ;;
+                   cap-first)   opts=("${cap_first[@]}") ;; esac
+    make_tree 2; reset_state; real_fpwrap
+    out=$("$APPLY" "${opts[@]}" "${XFER[@]}" 2>&1); rc=$?
+    [[ $rc -ne 0 ]] && ok "T17-refuse[$tag]" || bad "T17-refuse[$tag]" "accepted: $out"
+    grep -q "mutually exclusive" <<< "$out" \
+        && ok "T17-refuse[$tag]-reason" || bad "T17-refuse[$tag]-reason" "$out"
+done
+
+# T17b: the cap is re-applied to the knobs when fan-calibrate lowers it after
+# the curve was written, which is the order fan-calibrate --apply actually uses.
+make_tree 2; reset_state; real_fpwrap
+NO_RESTART=1 "$APPLY" --knobs "45:0 60:100 95:255" "${XFER[@]}" >/dev/null 2>&1
+sed -i 's/^# Knobs:.*/# Knobs: 45:0 60:100 95:255/' "$ROOT/etc/fancontrol"
+echo 90 > "$ROOT/etc/fan-profile.maxpwm"
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T17b-recap-regen || bad T17b-recap-regen "rc=$rc $out"
+grep -qx "# Knobs: 45:0 60:90 95:90" "$ROOT/etc/fancontrol" \
+    && ok T17b-recap-clamps || bad T17b-recap-clamps "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+echo 150 > "$ROOT/etc/fan-profile.maxpwm"
+
+# T18: no juno-fan-curve means no way to evaluate the curve. Refuse up front
+# rather than write a config whose FCTEMPS names a missing program.
+make_tree 2; reset_state; real_fpwrap
+keep=$(md5sum < "$ROOT/etc/fancontrol")
+out=$(JFC_FAN_CURVE="$ROOT/bin/absent-fan-curve" "$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -ne 0 ]] && ok T18-no-helper-refused || bad T18-no-helper-refused "accepted: $out"
+grep -q "knob curves need" <<< "$out" && ok T18-no-helper-names-it || bad T18-no-helper-names-it "$out"
+[[ "$keep" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T18-no-helper-untouched || bad T18-no-helper-untouched "config rewritten"
+
+# T18b: a knob config whose helper vanished before a reboot. regen must leave
+# the file alone so fancontrol aborts into the EC curve, not rewrite it.
+make_tree 2; reset_state; real_fpwrap
+"$APPLY" --knobs "$KN" "${XFER[@]}" >/dev/null 2>&1
+sed -i "s|!$JFC_FAN_CURVE|!$ROOT/bin/absent-fan-curve|g" "$ROOT/etc/fancontrol"
+keep=$(md5sum < "$ROOT/etc/fancontrol")
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T18b-regen-survives || bad T18b-regen-survives "rc=$rc $out"
+[[ "$keep" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T18b-regen-untouched || bad T18b-regen-untouched "regen rewrote a config it cannot evaluate"
+grep -q "knob helper" <<< "$out" && ok T18b-regen-warns || bad T18b-regen-warns "$out"
+
+# T19: one-fan machine. The regen replay rewrites from the live pwm count, so a
+# hardcoded pwm1+pwm2 knob emit would resurrect pwm2 here.
+make_tree 1; reset_state; real_fpwrap
+out=$("$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T19-one-fan-knobs || bad T19-one-fan-knobs "rc=$rc $out"
+grep -q pwm2 "$ROOT/etc/fancontrol" && bad T19-one-fan-no-pwm2 "pwm2 resurrected" || ok T19-one-fan-no-pwm2
+grep -qx "# Knobs: $KN" "$ROOT/etc/fancontrol" \
+    && ok T19-one-fan-knob-line || bad T19-one-fan-knob-line "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+
+# T20: DEVNAME must come from sysfs in BOTH shell writers, not from this
+# board's names. fancontrol matches DEVNAME against the sanitized contents of
+# <hwmon>/name, so a hardcoded name is a config ValidateDevices rejects. The
+# other checks all run on a fixture that reports the real names, so they pass
+# whether the writers read sysfs or not -- only a renamed fixture can tell.
+FAN_NAME="Clevo Fan X=Y" TEMP_NAME="core temp=2" make_tree 2
+reset_state; real_fpwrap
+# NO_RESTART: the restart replays `fan-profile regen`, which rewrites DEVNAME
+# and would mask a hardcoded name in the helper. Each writer is checked alone.
+out=$(NO_RESTART=1 "$APPLY" 10 60 95 70 50 0 120 4 quiet 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T20-renamed-applied || bad T20-renamed-applied "rc=$rc $out"
+grep -qx "DEVNAME=hwmon7=Clevo_Fan_X_Y hwmon10=core_temp_2" "$ROOT/etc/fancontrol" \
+    && ok T20-apply-reads-devnames \
+    || bad T20-apply-reads-devnames "$(grep '^DEVNAME' "$ROOT/etc/fancontrol")"
+# Now regen, which rewrites the same line from fan-profile.
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T20-regen-ran || bad T20-regen-ran "rc=$rc $out"
+grep -qx "DEVNAME=hwmon7=Clevo_Fan_X_Y hwmon10=core_temp_2" "$ROOT/etc/fancontrol" \
+    && ok T20-regen-reads-devnames \
+    || bad T20-regen-reads-devnames "$(grep '^DEVNAME' "$ROOT/etc/fancontrol")"
 
 echo
 echo "helper tests: $PASS passed, $FAIL failed"

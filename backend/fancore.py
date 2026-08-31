@@ -15,8 +15,30 @@ from dataclasses import dataclass, replace
 PWM_MIN, PWM_MAX = 0, 255
 DEFAULT_CONFIG = "/etc/fancontrol"
 DEFAULT_CAP = "/etc/fan-profile.maxpwm"
-DEFAULT_FAN_PROFILE = "/usr/local/bin/fan-profile"
+# The package installs fan-profile in /usr/bin. /usr/local/bin is the legacy
+# location from the hand-installed system-fixes era and still wins on PATH, so
+# a machine that has both must resolve to whichever one is actually there.
+FAN_PROFILE_PATHS = ("/usr/bin/fan-profile", "/usr/local/bin/fan-profile")
+DEFAULT_FAN_PROFILE = next((p for p in FAN_PROFILE_PATHS if os.path.exists(p)),
+                          FAN_PROFILE_PATHS[0])
 DEFAULT_PLATFORM = "/sys/devices/platform"
+# The `!`-prefixed FCTEMPS source used in knob mode. Same two-location search as
+# fan-profile: packaged in /usr/bin, hand-installed in /usr/local/bin.
+FAN_CURVE_PATHS = ("/usr/bin/juno-fan-curve", "/usr/local/bin/juno-fan-curve")
+DEFAULT_FAN_CURVE = next((p for p in FAN_CURVE_PATHS if os.path.exists(p)),
+                        FAN_CURVE_PATHS[0])
+MAX_KNOBS = 16
+
+# fancontrol interpolates ONE linear segment, so a multi-knob curve cannot be
+# written into /etc/fancontrol directly. Knob mode instead feeds fancontrol a
+# virtual temperature through an executable FCTEMPS source and calibrates the
+# segment into the identity: with MINTEMP=0, MAXTEMP=255, MINSTOP=0, MAXPWM=255
+# the law
+#     pwm = (tval - mint) * (maxpwm - minso) / (maxt - mint) + minso
+# becomes pwm = tval * 255 / 255000 = tval / 1000 in exact integer arithmetic.
+# The helper therefore reports pwm_at(real_temp) * 1000 millidegrees and
+# fancontrol writes back exactly pwm_at(real_temp).
+KNOB_XFER = {"mintemp": 0, "maxtemp": 255, "minstop": 0, "minpwm": 0, "maxpwm": 255}
 
 
 class HwmonNotFound(RuntimeError):
@@ -36,10 +58,17 @@ class Curve:
     average: int = 4
     label: str = "custom"
     ignore_cap: bool = False  # fan-profile: only turbo ignores the calibrated cap
+    # Knob mode: (temp_c, pwm) control points, ascending temp, non-decreasing
+    # pwm, at least two. Empty means the native single-segment law above, where
+    # mintemp..maxpwm are the curve. When knobs is set those fields hold
+    # KNOB_XFER instead and carry no user-facing meaning.
+    knobs: tuple[tuple[int, int], ...] = ()
 
     def validate(self) -> None:
         """Rules fancontrol itself enforces (it refuses bad configs), plus the
-        MINPWM <= MINSTOP < MAXPWM ordering fan-profile documents."""
+        MINPWM <= MINSTOP < MAXPWM ordering fan-profile documents. In knob mode
+        the single-segment fields are the fixed KNOB_XFER calibration, so the
+        knob list is validated in their place."""
         c = self
         for name in ("interval", "mintemp", "maxtemp", "minstart", "minstop",
                      "minpwm", "maxpwm", "average"):
@@ -47,36 +76,107 @@ class Curve:
                 raise ValueError(f"{name} must be an integer")
         if not 1 <= c.interval <= 60:
             raise ValueError(f"INTERVAL must be 1..60 s, got {c.interval}")
+        if not 1 <= c.average <= 16:
+            raise ValueError(f"AVERAGE must be 1..16, got {c.average}")
+        if not PWM_MIN <= c.minstart <= PWM_MAX:
+            raise ValueError(f"MINSTART must be {PWM_MIN}..{PWM_MAX}, got {c.minstart}")
+        if c.knobs:
+            c._validate_knobs()
+            return
         if not 0 <= c.mintemp <= 120 or not 0 <= c.maxtemp <= 130:
             raise ValueError(f"temps out of range: {c.mintemp}/{c.maxtemp}")
         if c.mintemp >= c.maxtemp:
             raise ValueError(f"MINTEMP ({c.mintemp}) must be < MAXTEMP ({c.maxtemp})")
-        for name, v in (("MINSTART", c.minstart), ("MINSTOP", c.minstop),
-                        ("MINPWM", c.minpwm), ("MAXPWM", c.maxpwm)):
+        for name, v in (("MINSTOP", c.minstop), ("MINPWM", c.minpwm),
+                        ("MAXPWM", c.maxpwm)):
             if not PWM_MIN <= v <= PWM_MAX:
                 raise ValueError(f"{name} must be {PWM_MIN}..{PWM_MAX}, got {v}")
         if c.minpwm > c.minstop:
             raise ValueError(f"MINPWM ({c.minpwm}) must be <= MINSTOP ({c.minstop})")
         if c.minstop >= c.maxpwm:
             raise ValueError(f"MINSTOP ({c.minstop}) must be < MAXPWM ({c.maxpwm})")
-        if not 1 <= c.average <= 16:
-            raise ValueError(f"AVERAGE must be 1..16, got {c.average}")
+        # MINSTART is the kick-start pulse used to spin a stopped fan back up.
+        # Below MINSTOP it cannot do that and the fan stays stopped while the
+        # temperature climbs. Every fan-profile preset satisfies this.
+        if c.minstart < c.minstop:
+            raise ValueError(f"MINSTART ({c.minstart}) must be >= MINSTOP ({c.minstop})")
+
+    def _validate_knobs(self) -> None:
+        k = self.knobs
+        if len(k) < 2:
+            raise ValueError(f"a knob curve needs at least 2 knobs, got {len(k)}")
+        if len(k) > MAX_KNOBS:
+            raise ValueError(f"at most {MAX_KNOBS} knobs, got {len(k)}")
+        for t, pwm in k:
+            if not isinstance(t, int) or not isinstance(pwm, int):
+                raise ValueError(f"knob ({t}, {pwm}) must be a pair of integers")
+            if not 0 <= t <= 130:
+                raise ValueError(f"knob temperature must be 0..130 C, got {t}")
+            if not PWM_MIN <= pwm <= PWM_MAX:
+                raise ValueError(f"knob pwm must be {PWM_MIN}..{PWM_MAX}, got {pwm}")
+        for (t0, p0), (t1, p1) in zip(k, k[1:]):
+            if t1 <= t0:
+                raise ValueError(f"knob temperatures must ascend, got {t0} then {t1}")
+            # A fan curve that falls with temperature drives the fan the wrong
+            # way as the CPU heats up. Reject it rather than let the GUI emit it.
+            if p1 < p0:
+                raise ValueError(f"knob pwm must not fall, got {p0} then {p1} at {t1} C")
 
     def pwm_at(self, temp_c: int) -> int:
-        """fancontrol's control law (UpdateFanSpeeds): MINPWM below MINTEMP,
-        linear ramp from MINSTOP to MAXPWM between MINTEMP and MAXTEMP,
-        MAXPWM above. Integer math like the shell script (truncate)."""
+        """The commanded pwm at a temperature. In knob mode, piecewise linear
+        between the knobs and flat outside the end knobs. Otherwise fancontrol's
+        own law (UpdateFanSpeeds): MINPWM below MINTEMP, linear ramp from
+        MINSTOP to MAXPWM between MINTEMP and MAXTEMP, MAXPWM above. Integer
+        truncation in both cases, matching the shell script."""
         c = self
+        if c.knobs:
+            k = c.knobs
+            if temp_c <= k[0][0]:
+                return k[0][1]
+            if temp_c >= k[-1][0]:
+                return k[-1][1]
+            for (t0, p0), (t1, p1) in zip(k, k[1:]):
+                if temp_c <= t1:
+                    return (temp_c - t0) * (p1 - p0) // (t1 - t0) + p0
+            raise AssertionError("unreachable: temp_c is below the last knob")
         if temp_c <= c.mintemp:
             return c.minpwm
         if temp_c >= c.maxtemp:
             return c.maxpwm
         return (temp_c - c.mintemp) * (c.maxpwm - c.minstop) // (c.maxtemp - c.mintemp) + c.minstop
 
+    def as_knobs(self) -> tuple[tuple[int, int], ...]:
+        """The native single-segment law expressed as knobs, for handing a
+        preset to the knob editor without changing what the fan does.
+
+        The native law jumps from MINPWM to MINSTOP at MINTEMP, which a
+        polyline cannot hold. The step goes one degree BELOW MINTEMP so the
+        ramp knob keeps the native origin (MINTEMP, MINSTOP) and span, making
+        the conversion exact at every integer temperature except MINTEMP
+        itself, where the fan runs at MINSTOP rather than MINPWM. Putting the
+        step above MINTEMP instead shortens the ramp and costs up to 6 pwm
+        across its whole length. When MINPWM and MINSTOP coincide (turbo)
+        there is no step and two knobs suffice."""
+        if self.knobs:
+            return self.knobs
+        k = []
+        if self.minstop != self.minpwm and self.mintemp > 0:
+            k.append((self.mintemp - 1, self.minpwm))
+        k.append((self.mintemp, self.minstop if k else self.minpwm))
+        k.append((self.maxtemp, self.maxpwm))
+        return tuple(k)
+
     def clamped(self, cap: int | None) -> "Curve":
         """fan-profile's apply_fancontrol: honor the calibrated noise cap
         unless the profile opts out (turbo)."""
-        if cap is not None and not self.ignore_cap and self.maxpwm > cap:
+        if cap is None or self.ignore_cap:
+            return self
+        if self.knobs:
+            if max(pwm for _, pwm in self.knobs) <= cap:
+                return self
+            return replace(self, knobs=tuple((t, min(pwm, cap))
+                                             for t, pwm in self.knobs))
+        if self.maxpwm > cap:
             return replace(self, maxpwm=cap)
         return self
 
@@ -127,24 +227,60 @@ def discover(platform_dir: str = DEFAULT_PLATFORM) -> Hwmon:
                  pwms=pwms, fans=fans)
 
 
-def render_config(curve: Curve, hw: Hwmon, now: str) -> str:
+def knobs_line(knobs: tuple[tuple[int, int], ...]) -> str:
+    """The knob list as the config comment fancontrol ignores and both
+    juno-fan-curve and `fan-profile regen` read back."""
+    return "# Knobs: " + " ".join(f"{t}:{pwm}" for t, pwm in knobs)
+
+
+_KNOBS_RE = re.compile(r"^# Knobs:((?:[ \t]+\d+:\d+)+)[ \t]*$", re.M)
+
+
+def parse_knobs(text: str) -> tuple[tuple[int, int], ...]:
+    """Knobs from a config, or () when the config is a native single-segment
+    curve. Never raises: a malformed line reads as 'no knobs' and the caller
+    falls back to the single-segment law that is also on disk."""
+    m = _KNOBS_RE.search(text)
+    if not m:
+        return ()
+    return tuple((int(a), int(b))
+                 for a, b in (kv.split(":") for kv in m.group(1).split()))
+
+
+def render_config(curve: Curve, hw: Hwmon, now: str,
+                  fan_curve: str = DEFAULT_FAN_CURVE) -> str:
     """Byte-compatible with fan-profile's write_curve output: same two-line
     header (so `fan-profile status` parses the label), same key order and
-    spacing. `now` is passed in so tests can compare byte-exact."""
+    spacing. `now` is passed in so tests can compare byte-exact.
+
+    A knob curve additionally carries a `# Knobs:` line, points FCTEMPS at the
+    executable juno-fan-curve source, and pins the single segment to KNOB_XFER
+    so fancontrol writes back the helper's reported value divided by 1000."""
     c = curve
     f, t = hw.fan_hwmon, hw.temp_hwmon
 
     def per_pwm(key: str, value: int) -> str:
         return key + "=" + " ".join(f"{f}/{p}={value}" for p in hw.pwms)
 
+    if c.knobs:
+        c = replace(c, **KNOB_XFER)
+        head = [knobs_line(curve.knobs),
+                "# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX",
+                "# values below are the fixed transfer calibration, not the curve."]
+        fctemps = " ".join(f"{f}/{p}=!{fan_curve}" for p in hw.pwms)
+    else:
+        head = ["# Edit MIN/MAX values then run: fancontrol or fan-profile "
+                + (c.label if c.label in ("quiet", "balanced", "cool", "turbo")
+                   else "quiet")]
+        fctemps = " ".join(f"{f}/{p}={t}/{hw.temp_input}" for p in hw.pwms)
+
     lines = [
         f"# Managed by fan-profile ({c.label}) — {now}",
-        "# Edit MIN/MAX values then run: fancontrol or fan-profile "
-        + (c.label if c.label in ("quiet", "balanced", "cool", "turbo") else "quiet"),
+        *head,
         f"INTERVAL={c.interval}",
         f"DEVPATH={f}=devices/platform/clevofan {t}=devices/platform/coretemp.0",
         f"DEVNAME={f}={hw.fan_devname} {t}={hw.temp_devname}",
-        "FCTEMPS=" + " ".join(f"{f}/{p}={t}/{hw.temp_input}" for p in hw.pwms),
+        "FCTEMPS=" + fctemps,
         "FCFANS=" + " ".join(f"{f}/{p}={f}/{fan}" for p, fan in zip(hw.pwms, hw.fans)),
     ]
     for key, value in (("MINTEMP", c.mintemp), ("MAXTEMP", c.maxtemp),
@@ -174,7 +310,8 @@ def parse_config(text: str) -> Curve:
     m = re.search(r"^# Managed by fan-profile \((\w+)\)", text, re.M)
     if m:
         label = m.group(1)
-    return Curve(interval=int(interval.group(1)), **values, label=label)
+    return Curve(interval=int(interval.group(1)), **values, label=label,
+                 knobs=parse_knobs(text))
 
 
 _PRESET_RE = re.compile(
@@ -182,7 +319,7 @@ _PRESET_RE = re.compile(
 
 
 def parse_presets(fan_profile_text: str) -> dict[str, Curve]:
-    """Scrape the profile table out of /usr/local/bin/fan-profile so the GUI
+    """Scrape the profile table out of the fan-profile script so the GUI
     presets can never drift from the CLI. 8th arg (when present) is the clamp
     flag: 0 means 'ignore the calibrated cap' (turbo)."""
     presets: dict[str, Curve] = {}

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Installed entry point (deb: /usr/bin, manual: /usr/local/bin). Keeps the
+# python app in /usr/lib/juno-kde-fancontrol non-executable as lintian wants.
+exec python3 /usr/lib/juno-kde-fancontrol/fancurve.py "$@"

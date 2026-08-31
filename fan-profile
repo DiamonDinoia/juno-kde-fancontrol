@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# fan-profile — switch laptop fan behavior on the fly.
+#
+# Backends:
+#   quiet|balanced|cool|turbo : tunable curves driven by `fancontrol` (manual PWM)
+#   auto                      : hand the fan to the Clevo EC firmware curve
+#
+# Non-turbo curves are clamped to a calibrated noise ceiling if
+# /etc/fan-profile.maxpwm exists (written by `fan-calibrate --apply`). `turbo`
+# ignores the cap and is the only profile allowed to reach full speed.
+#
+# Installed to /usr/bin by the juno-kde-fancontrol package.
+set -euo pipefail
+
+FANCONFIG="${FP_FANCONFIG:-/etc/fancontrol}"
+CAP_FILE="${FP_CAP_FILE:-/etc/fan-profile.maxpwm}"
+SYSFS="${FP_SYSFS:-/sys/devices/platform}"
+CLEVO_GLOB="$SYSFS/clevofan/hwmon/hwmon*"
+
+# hwmon indices are NOT stable across reboots, and fancontrol matches devices
+# by the literal hwmonN index (ValidateDevices, not by name). So resolve the
+# current index for each device fresh on every run and write THOSE into the
+# config. `regen` below re-runs this at boot via an ExecStartPre drop-in.
+resolve_hw() {
+    local d
+    d=$(ls -d "$SYSFS/$1"/hwmon/hwmon* 2>/dev/null | head -1) || true
+    [[ -n "$d" ]] && basename "$d"
+}
+FANHW=$(resolve_hw clevofan)   || FANHW=hwmon9
+TEMPHW=$(resolve_hw coretemp.0) || TEMPHW=hwmon10
+
+# fancontrol matches DEVNAME against the sanitized contents of <hwmon>/name, so
+# read both names rather than hardcoding this board's. A wrong name makes
+# ValidateDevices reject the whole config. Fall back to the known pair when the
+# hwmon is absent, matching the index fallbacks above.
+devname_of() {
+    local f="$SYSFS/$1/hwmon/$2/name"
+    [[ -s "$f" ]] && sed 's/[[:space:]=]/_/g' < "$f"
+}
+FAN_DEVNAME=$(devname_of clevofan "$FANHW")     || FAN_DEVNAME=V5xTNC_TND_TNE
+TEMP_DEVNAME=$(devname_of coretemp.0 "$TEMPHW") || TEMP_DEVNAME=coretemp
+
+# fancontrol needs one entry per pwm channel. This laptop family has two, but
+# juno-kde-fancontrol writes however many exist, so regen must not force the
+# count back to two. Fall back to the known pair when the hwmon is missing.
+PWMS=()
+for _p in "$SYSFS/clevofan/hwmon/$FANHW"/pwm[0-9]; do
+    [[ -e "$_p" ]] && PWMS+=("$(basename "$_p")")
+done
+((${#PWMS[@]})) || PWMS=(pwm1 pwm2)
+
+# Knob-mode configs (written by juno-kde-fancontrol) drive fancontrol through
+# an executable FCTEMPS source rather than a hwmon temp input, because
+# fancontrol interpolates only one linear segment. The curve itself lives in the
+# `# Knobs:` comment and the MIN/MAX keys hold a fixed transfer calibration.
+# regen carries both through untouched and refreshes only the fan hwmon index.
+KNOB_HELPER=""   # non-empty selects the knob-mode header, set by regen_custom
+KNOB_LINE=""
+
+# per_pwm KEY VALUE -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=VALUE ..."
+per_pwm() {
+    local out=() p
+    for p in "${PWMS[@]}"; do out+=("$FANHW/$p=$2"); done
+    echo "$1=${out[*]}"
+}
+
+usage() {
+    cat <<EOF
+Usage: fan-profile {quiet|balanced|cool|turbo|auto|status|regen}
+
+  quiet     near-silent; fan off below 60C, gentle ramp to 95C   (fancontrol)
+  balanced  small floor (never fully off), ramps 55C -> 90C       (fancontrol)
+  cool      starts early at 45C, full by 80C                      (fancontrol)
+  turbo     aggressive, reaches full speed — ignores noise cap     (fancontrol)
+  auto      hand the fan to the EC firmware curve, stop daemon     (EC)
+  status    show backend, pwm mode, temps, fan RPM, noise cap      (no sudo)
+  regen     rewrite config for current hwmon indices, no restart   (boot hook;
+            custom labels and knob curves keep their on-disk values)
+
+Non-turbo profiles are clamped to the calibrated cap in $CAP_FILE if present.
+Run 'fan-calibrate --apply' to measure and set that cap from the mic.
+EOF
+}
+
+# Device-resolution header. fancontrol pins by literal hwmonN, so we emit the
+# indices resolved above ($FANHW = clevofan PWM/fan, $TEMPHW = coretemp).
+fan_header() {
+    local temps=() fans=() p
+    for p in "${PWMS[@]}"; do
+        if [[ -n "$KNOB_HELPER" ]]; then
+            temps+=("$FANHW/$p=!$KNOB_HELPER")
+        else
+            temps+=("$FANHW/$p=$TEMPHW/temp1_input")
+        fi
+        fans+=("$FANHW/$p=$FANHW/fan${p#pwm}_input")
+    done
+    echo "DEVPATH=$FANHW=devices/platform/clevofan $TEMPHW=devices/platform/coretemp.0"
+    echo "DEVNAME=$FANHW=$FAN_DEVNAME $TEMPHW=$TEMP_DEVNAME"
+    echo "FCTEMPS=${temps[*]}"
+    echo "FCFANS=${fans[*]}"
+}
+
+# write_curve INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM
+write_curve() {
+    {
+        echo "# Managed by fan-profile ($PROFILE) — $(date '+%Y-%m-%d %H:%M')"
+        # Must stay byte-identical to fancore.render_config, which writes the
+        # same file from the GUI. tests/test_fancore.py compares the two.
+        if [[ -n "$KNOB_LINE" ]]; then
+            echo "$KNOB_LINE"
+            echo "# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX"
+            echo "# values below are the fixed transfer calibration, not the curve."
+        else
+            echo "# Edit MIN/MAX values then run: fancontrol or fan-profile $PROFILE"
+        fi
+        echo "INTERVAL=$1"
+        fan_header
+        per_pwm MINTEMP  "$2"
+        per_pwm MAXTEMP  "$3"
+        per_pwm MINSTART "$4"
+        per_pwm MINSTOP  "$5"
+        per_pwm MINPWM   "$6"
+        per_pwm MAXPWM   "$7"
+        per_pwm AVERAGE  4
+    } > "$FANCONFIG"
+}
+
+# apply_fancontrol INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM [clamp]
+# clamp defaults to 1 (honor the calibrated cap); turbo passes 0.
+apply_fancontrol() {
+    local maxpwm="$7" clamp="${8:-1}"
+    # In knob mode MAXPWM is the transfer calibration, not a fan speed.
+    # Clamping it would rescale every commanded pwm by cap/255 — the cap
+    # belongs on the knobs, which cap_knobs handles before this runs.
+    [[ -n "$KNOB_LINE" ]] && clamp=0
+    if [[ "$clamp" == "1" && -f "$CAP_FILE" ]]; then
+        local cap; cap=$(tr -dc '0-9' < "$CAP_FILE")
+        if [[ -n "$cap" ]] && (( maxpwm > cap )); then
+            maxpwm="$cap"
+        fi
+    fi
+    write_curve "$1" "$2" "$3" "$4" "$5" "$6" "$maxpwm"
+    # regen (boot ExecStartPre) only rewrites the file; touching systemctl here
+    # would recurse into the unit that is currently starting us.
+    if [[ "${NO_RESTART:-0}" != "1" ]]; then
+        systemctl disable --now clevofan-auto.service 2>/dev/null || true
+        systemctl enable fancontrol.service >/dev/null 2>&1 || true
+        systemctl restart fancontrol.service
+    fi
+}
+
+apply_auto() {
+    systemctl disable --now fancontrol.service 2>/dev/null || true
+    for f in $CLEVO_GLOB/pwm1_enable $CLEVO_GLOB/pwm2_enable; do
+        [[ -e "$f" ]] && echo 2 > "$f"
+    done
+}
+
+show_status() {
+    echo "backend      : fancontrol.service=$(systemctl is-active fancontrol 2>/dev/null)"
+    echo "hwmon        : clevofan=$FANHW coretemp=$TEMPHW"
+    for f in $CLEVO_GLOB/pwm1_enable $CLEVO_GLOB/pwm2_enable; do
+        [[ -e "$f" ]] && echo "$(basename "$f") = $(cat "$f")   (1=manual/fancontrol, 2=EC auto)"
+    done
+    for f in $CLEVO_GLOB/fan1_input $CLEVO_GLOB/fan2_input; do
+        [[ -e "$f" ]] && echo "$(basename "$f") = $(cat "$f") RPM"
+    done
+    command -v sensors >/dev/null && sensors 2>/dev/null | awk '/Package id 0/{print "CPU package  : "$4}'
+    [[ -f "$CAP_FILE" ]] && echo "noise cap    : MAXPWM <= $(cat "$CAP_FILE") (calibrated; turbo exempt)" \
+                         || echo "noise cap    : none (run fan-calibrate --apply)"
+    if [[ -f "$FANCONFIG" ]]; then
+        echo "active curve : $(grep -m1 '^# Managed by fan-profile' "$FANCONFIG" | sed 's/^# Managed by fan-profile (//; s/).*//')"
+        # In knob mode the MIN/MAX keys are the transfer calibration, not the
+        # curve, so print the knobs instead of misreporting 0..255 as a ramp.
+        if grep -q '^# Knobs:' "$FANCONFIG"; then
+            echo "  knobs (C:pwm) :$(sed -n 's/^# Knobs://p' "$FANCONFIG")"
+            grep -E '^INTERVAL=' "$FANCONFIG" | sed 's/^/  /'
+        else
+            grep -E '^(INTERVAL|MINTEMP|MAXTEMP|MINPWM|MAXPWM)=' "$FANCONFIG" | sed 's/^/  /'
+        fi
+    fi
+}
+
+PROFILE="${1:-status}"
+
+if [[ "$PROFILE" == "status" ]]; then show_status; exit 0; fi
+if [[ "$PROFILE" == "-h" || "$PROFILE" == "--help" || "$PROFILE" == "help" ]]; then usage; exit 0; fi
+
+# Mutating commands need root. FP_AS_ROOT=1 skips the sudo re-exec (test
+# harness: the fpwrap fixture sets it alongside FP_SYSFS/FP_FANCONFIG).
+if [[ "$(id -u)" -ne 0 && "${FP_AS_ROOT:-0}" != "1" ]]; then exec sudo "$0" "$@"; fi
+
+# regen_value CFG KEY -> first pwm1 value of a fancontrol key line
+regen_value() { sed -n "s/^$2=\\S*=\\([0-9]\\+\\).*/\\1/p" "$1" | head -1; }
+
+# Apply the calibrated noise ceiling to KNOB_LINE. fan-calibrate --apply writes
+# a new cap and then re-applies the current profile, which for a knob curve
+# lands in regen_custom — so this is where a freshly lowered cap takes effect.
+cap_knobs() {
+    local cap out=() kv t pwm
+    [[ -f "$CAP_FILE" ]] || return 0
+    cap=$(tr -dc '0-9' < "$CAP_FILE")
+    [[ -n "$cap" ]] || return 0
+    for kv in ${KNOB_LINE#'# Knobs:'}; do
+        t=${kv%%:*}; pwm=${kv##*:}
+        (( pwm > cap )) && pwm=$cap
+        out+=("$t:$pwm")
+    done
+    KNOB_LINE="# Knobs: ${out[*]}"
+}
+
+# regen for a custom label (written by juno-kde-fancontrol): re-emit the
+# on-disk curve values with freshly-resolved hwmon indices, keeping the label.
+regen_custom() {
+    local interval mintemp maxtemp minstart minstop minpwm maxpwm average v
+    KNOB_LINE=$(grep -m1 '^# Knobs:' "$FANCONFIG") || KNOB_LINE=""
+    if [[ -n "$KNOB_LINE" ]]; then
+        KNOB_HELPER=$(sed -n 's|^FCTEMPS=[^ ]*=!\([^ ]*\).*|\1|p' "$FANCONFIG" | head -1)
+        if [[ ! -x "$KNOB_HELPER" ]]; then
+            # No helper means no way to evaluate the curve. Leaving the file
+            # alone makes fancontrol abort on ValidateDevices, which hands the
+            # fans back to the EC — the safe outcome, not a silent wrong curve.
+            echo "fan-profile regen: knob helper '${KNOB_HELPER:-none}' missing or not executable, $FANCONFIG left untouched" >&2
+            exit 0
+        fi
+    fi
+    [[ -n "$KNOB_LINE" ]] && cap_knobs
+    interval=$(sed -n 's/^INTERVAL=\([0-9]\+\).*/\1/p' "$FANCONFIG" | head -1)
+    average=$(regen_value "$FANCONFIG" AVERAGE)
+    mintemp=$(regen_value "$FANCONFIG" MINTEMP)
+    maxtemp=$(regen_value "$FANCONFIG" MAXTEMP)
+    minstart=$(regen_value "$FANCONFIG" MINSTART)
+    minstop=$(regen_value "$FANCONFIG" MINSTOP)
+    minpwm=$(regen_value "$FANCONFIG" MINPWM)
+    maxpwm=$(regen_value "$FANCONFIG" MAXPWM)
+    # Every key must parse. A concatenated -z test would let one missing key
+    # through and write "MINSTART=hwmon7/pwm1=", which fancontrol --check
+    # accepts and then reads as 0 at runtime (no kick-start pulse).
+    for v in "$interval" "$mintemp" "$maxtemp" "$minstart" "$minstop" "$minpwm" "$maxpwm"; do
+        if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+            # Never fail the boot ExecStartPre: leave the file for fancontrol
+            # --check (the next ExecStartPre) to arbitrate.
+            echo "fan-profile regen: cannot parse values in $FANCONFIG, left untouched" >&2
+            exit 0
+        fi
+    done
+    apply_fancontrol "$interval" "$mintemp" "$maxtemp" "$minstart" "$minstop" "$minpwm" "$maxpwm"
+    # write_curve hardcodes AVERAGE=4; restore a custom value (per-pwm
+    # replacement — a greedy match would only rewrite the last entry).
+    if [[ "$average" =~ ^[0-9]+$ ]] && (( average >= 1 && average <= 16 && average != 4 )); then
+        sed -i -E "/^AVERAGE=/ s/(pwm[0-9]+=)[0-9]+/\1$average/g" "$FANCONFIG"
+    fi
+}
+
+# regen: re-emit the currently-active profile with freshly-resolved hwmon
+# indices, without restarting the unit. Used as a boot-time ExecStartPre so the
+# config always matches this boot's hwmon numbering.
+if [[ "$PROFILE" == "regen" ]]; then
+    NO_RESTART=1
+    PROFILE=$(grep -m1 '^# Managed by fan-profile' "$FANCONFIG" 2>/dev/null | sed 's/.*(//; s/).*//') || true
+    [[ -n "${PROFILE:-}" ]] || PROFILE=quiet
+    # auto has no fancontrol curve to write; nothing to resync.
+    [[ "$PROFILE" == "auto" ]] && exit 0
+    case "$PROFILE" in
+        quiet|balanced|cool|turbo) ;;  # replayed from the table below
+        *) regen_custom; exit $? ;;    # custom label: keep values, fresh indices
+    esac
+fi
+
+case "$PROFILE" in
+    #                   INT MINT MAXT MSTART MSTOP MINPWM MAXPWM [clamp]
+    # fancontrol rule: MINPWM <= MINSTOP < MAXPWM (else it rejects the config).
+    quiet)    apply_fancontrol 10  60   95    70     50    0     120 ;;
+    balanced) apply_fancontrol 10  55   90    60     45    40    255 ;;
+    cool)     apply_fancontrol 10  45   80    60     60    60    255 ;;
+    turbo)    apply_fancontrol 5   40   80    100    100   100   255  0 ;;
+    auto)     apply_auto ;;
+    *) echo "fan-profile: unknown profile '$PROFILE'" >&2; usage; exit 1 ;;
+esac

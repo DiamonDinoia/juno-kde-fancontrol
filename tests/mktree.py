@@ -6,6 +6,7 @@ from pathlib import Path
 
 def make_platform(root, *, fan_hw: str = "hwmon7", temp_hw: str = "hwmon10",
                   n_fans: int = 2, fan_name: str = "V5xTNC_TND_TNE",
+                  temp_name: str = "coretemp",
                   temp_millic: int = 74000, rpms=(2560, 2480), pwms=(78, 78),
                   enables=(1, 1)) -> Path:
     root = Path(root)
@@ -14,7 +15,7 @@ def make_platform(root, *, fan_hw: str = "hwmon7", temp_hw: str = "hwmon10",
     fan_dir.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
     (fan_dir / "name").write_text(fan_name + "\n")
-    (temp_dir / "name").write_text("coretemp\n")
+    (temp_dir / "name").write_text(temp_name + "\n")
     (temp_dir / "temp1_input").write_text(f"{temp_millic}\n")
     for i in range(1, n_fans + 1):
         (fan_dir / f"pwm{i}").write_text(f"{pwms[i - 1]}\n")

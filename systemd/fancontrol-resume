@@ -1,0 +1,3 @@
+#!/bin/sh
+# Restart fancontrol after resume so the curve re-attaches to the EC.
+case "$1" in post) systemctl try-restart fancontrol.service ;; esac

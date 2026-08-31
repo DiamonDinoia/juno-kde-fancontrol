@@ -12,13 +12,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# A render must not depend on whoever runs it: without this, ktheme reads the
+# developer's own kdeglobals and a light render picks up a dark scheme's greys.
+# An empty config home makes QStandardPaths find no scheme file, which is also
+# the container's state.
+os.environ["XDG_CONFIG_HOME"] = tempfile.mkdtemp(prefix="jfc-noscheme-")
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 import app as fanapp
 import mktree
-from backend.fancore import discover, parse_presets, render_config
+from backend.fancore import Curve, discover, parse_presets, render_config
 
 FIXTURE_FP = Path(__file__).resolve().parent / "fixtures" / "fan-profile"
 NOW = "2026-08-31 07:35"
@@ -31,6 +36,12 @@ def main() -> int:
     ap.add_argument("--dark", action="store_true")
     ap.add_argument("--auto", action="store_true")
     ap.add_argument("--style", default="fusion")
+    ap.add_argument("--knobs", default="",
+                    help='knob curve as "T:P T:P ...": renders the multi-point '
+                         "editor instead of the two-point ramp")
+    ap.add_argument("--hide-chart", action="store_true",
+                    help="render without the curve chart: the defect control the "
+                         "vision rubric must flag (tools/vision_check.py)")
     args = ap.parse_args()
 
     work = Path(tempfile.mkdtemp(prefix="jfc-render-"))
@@ -41,10 +52,15 @@ def main() -> int:
     (etc / "fan-profile.maxpwm").write_text("150\n")
 
     curve = parse_presets(FIXTURE_FP.read_text())[args.preset]
+    if args.knobs:
+        knobs = tuple(tuple(map(int, kv.split(":"))) for kv in args.knobs.split())
+        curve = Curve(interval=curve.interval, minstart=curve.minstart,
+                      average=curve.average, label="custom", knobs=knobs)
+        curve.validate()
     hw = discover(str(platform))
     config = etc / "fancontrol"
     config.write_text(render_config(curve.clamped(None if curve.ignore_cap else 150),
-                                    hw, NOW))
+                                    hw, NOW, fan_curve="/usr/bin/juno-fan-curve"))
 
     fakectl = mktree.write_fake_systemctl(work / "systemctl", work / "systemctl.log")
 
@@ -58,6 +74,8 @@ def main() -> int:
                             systemctl=str(fakectl), screenshot=None, dark=args.dark,
                             preset=None, auto=args.auto, no_apply=True)
     win = fanapp.MainWindow(ns)
+    if args.hide_chart:
+        win.canvas.hide()
     win.show()
 
     state: dict[str, bool] = {}

@@ -17,17 +17,20 @@ from dataclasses import replace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtCore import (QFileSystemWatcher, QPointF, QProcess, QRectF, Qt,
-                            QTimer, Signal)
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPalette, QPen
+from PySide6.QtCore import (QEvent, QFileSystemWatcher, QPointF, QProcess,
+                            QRectF, Qt, QTimer, Signal)
+from PySide6.QtGui import (QColor, QFont, QIcon, QMouseEvent, QPainter,
+                           QPalette, QPen)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QFormLayout,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QMessageBox, QPushButton, QRadioButton,
                                QSizePolicy, QSpinBox, QVBoxLayout, QWidget)
 
+from backend import ktheme
 from backend.fancore import (DEFAULT_CAP, DEFAULT_CONFIG, DEFAULT_FAN_PROFILE,
-                             DEFAULT_PLATFORM, PWM_MAX, Curve, Hwmon,
-                             HwmonNotFound, discover, parse_config,
+                             DEFAULT_PLATFORM, KNOB_XFER, MAX_KNOBS,
+                             PWM_MAX, Curve,
+                             Hwmon, HwmonNotFound, discover, parse_config,
                              parse_presets, pwm_percent, read_cap,
                              read_sensors, service_state)
 
@@ -37,6 +40,14 @@ HANDLE_R = 9                      # drag handle radius, px
 # packaged one; a repo-local fallback would run a user-writable file via pkexec.
 HELPER_CANDIDATES = ("/usr/sbin/juno-fancontrol-apply",        # .deb
                      "/usr/local/sbin/juno-fancontrol-apply")  # install.sh
+# Both the launcher entry and the System Settings external module name this
+# file, so Plasma matches the window to it: the Wayland app_id, the task
+# manager icon and the System Settings page all come from one place.
+DESKTOP_FILE = "juno-kde-fancontrol"
+APP_ICON = "preferences-system-power-management"
+# An error must not be red-only text. \u26a0 is in every KDE font and needs no
+# icon theme, which the offscreen renders do not have.
+ERROR_PREFIX = "\u26a0 "
 
 
 def find_helper() -> str | None:
@@ -47,8 +58,12 @@ def find_helper() -> str | None:
 
 
 class CurveWidget(QWidget):
-    """The draggable pwm = f(temp) chart. Two handles: (MINTEMP, MINPWM) and
-    (MAXTEMP, MAXPWM); the drawn law matches fancore.Curve.pwm_at."""
+    """The draggable pwm = f(temp) chart; the drawn law is fancore.Curve.pwm_at.
+
+    A native curve has two handles, (MINTEMP, MINPWM) and (MAXTEMP, MAXPWM). A
+    left click on empty plot area adds a knob and switches the curve to knob
+    mode, where every knob is a handle, right-clicking one removes it, and the
+    law is the polyline through them."""
 
     curveChanged = Signal()
 
@@ -61,7 +76,15 @@ class CurveWidget(QWidget):
         self.cap: int | None = None
         self.live_temp: float | None = None
         self.live_pwm: int | None = None
-        self._drag: int = -1  # 0 = min handle, 1 = max handle
+        self._drag: int = -1   # index into _handles(), -1 while not dragging
+        self._hover: int = -1  # handle under the pointer, -1 for none
+        self._auto = False    # EC mode: the curve is inert, handles are not draggable
+
+    def _handles(self) -> tuple[tuple[int, int], ...]:
+        """The draggable points in draw and hit-test order. One list serves
+        both modes, so painting and hit-testing cannot disagree about them."""
+        c = self.curve
+        return c.knobs or ((c.mintemp, c.minpwm), (c.maxtemp, c.maxpwm))
 
     # -- coordinate mapping -------------------------------------------------
     def _plot(self) -> QRectF:
@@ -93,7 +116,8 @@ class CurveWidget(QWidget):
         c = self.curve
         pal = self.palette()
         fg = pal.color(QPalette.ColorRole.WindowText)
-        accent = pal.color(QPalette.ColorRole.Highlight)
+        k = ktheme.colors(pal)
+        accent = k.focus
         grid = QColor(fg)
         grid.setAlpha(50)
 
@@ -129,25 +153,28 @@ class CurveWidget(QWidget):
         # calibrated noise cap
         if self.cap is not None:
             y = self._to_px(TEMP_LO, self.cap).y()
-            pen = QPen(QColor("#c0392b"), 1.4, Qt.PenStyle.DashLine)
-            p.setPen(pen)
+            p.setPen(QPen(k.negative, 1.4, Qt.PenStyle.DashLine))
             p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
-            p.setPen(QColor("#c0392b"))
-            p.drawText(QRectF(r.right() - 150, y - 15, 148, 13),
+            p.setPen(k.negative)
+            p.drawText(QRectF(r.right() - 156, y - 15, 148, 13),
                        Qt.AlignmentFlag.AlignRight, f"calibrated cap {self.cap}")
 
-        # MINSTOP/MINSTART guides; one shared label when they coincide (turbo)
-        if c.minstart == c.minstop:
+        # MINSTOP/MINSTART guides; one shared label when they coincide (turbo).
+        # In knob mode MINSTOP is part of the transfer calibration and says
+        # nothing about the fan, so only the kick-start pulse is worth drawing.
+        if c.knobs:
+            guides = [(c.minstart, f"MINSTART {c.minstart}")]
+        elif c.minstart == c.minstop:
             guides = [(c.minstop, f"MINSTOP = MINSTART {c.minstop}")]
         else:
             guides = [(c.minstop, f"MINSTOP {c.minstop}"),
                       (c.minstart, f"MINSTART {c.minstart}")]
         for val, text in guides:
             y = self._to_px(TEMP_LO, val).y()
-            p.setPen(QPen(QColor("#7f8c8d"), 1, Qt.PenStyle.DotLine))
+            p.setPen(QPen(k.inactive, 1, Qt.PenStyle.DotLine))
             p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
-            p.setPen(QColor("#7f8c8d"))
-            p.drawText(QRectF(r.right() - 174, y - 13, 170, 12),
+            p.setPen(k.inactive)
+            p.drawText(QRectF(r.right() - 178, y - 13, 170, 12),
                        Qt.AlignmentFlag.AlignRight, text)
 
         # the control law, same integer math as fancontrol
@@ -161,7 +188,7 @@ class CurveWidget(QWidget):
         # of the plot the curve is NOT in at this temperature
         if self.live_temp is not None:
             x = self._to_px(min(max(self.live_temp, TEMP_LO), TEMP_HI), 0).x()
-            live = QColor("#27ae60")
+            live = k.positive
             p.setPen(QPen(live, 1.4, Qt.PenStyle.DashLine))
             p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
             p.setPen(live)
@@ -175,38 +202,121 @@ class CurveWidget(QWidget):
                 dot = QPointF(x, self._to_px(TEMP_LO, self.live_pwm).y())
                 p.drawEllipse(dot, 5, 5)
 
-        # handles
-        for t, pwm, enabled in ((c.mintemp, c.minpwm, True), (c.maxtemp, c.maxpwm, True)):
+        # handles: hollow in EC mode, where dragging is refused. The one in
+        # play grows and takes the hover decoration, so the pointer says which
+        # knob a click will move before it moves one.
+        handles = self._handles()
+        act = -1 if self._auto else (self._drag if self._drag >= 0 else self._hover)
+        if act >= len(handles):
+            act = -1        # its knob was removed before this repaint
+        for i, (t, pwm) in enumerate(handles):
             center = self._to_px(t, pwm)
-            p.setPen(QPen(fg, 1.4))
-            p.setBrush(accent if enabled else Qt.BrushStyle.NoBrush)
-            p.drawEllipse(center, HANDLE_R - 2, HANDLE_R - 2)
+            live = i == act
+            p.setPen(QPen(k.hover if live else fg, 1.4))
+            p.setBrush(Qt.BrushStyle.NoBrush if self._auto else accent)
+            rad = HANDLE_R if live else HANDLE_R - 2
+            p.drawEllipse(center, rad, rad)
+
+        # The axes cannot be read to a degree while dragging, so the handle in
+        # play carries its own numbers, as every editor of this kind does.
+        if act >= 0:
+            t, pwm = handles[act]
+            at = self._to_px(t, pwm)
+            p.setPen(k.hover)
+            p.drawText(QRectF(min(at.x() + 11, r.right() - 96),
+                              max(at.y() - 25, r.top() + 2), 94, 15),
+                       Qt.AlignmentFlag.AlignLeft,
+                       f"{t} \u00b0C  \u2192  {pwm_percent(pwm)}")
+
+        if not self._auto:
+            p.setPen(QPen(k.inactive))
+            hint = ("click to add a knob, right-click a knob to remove"
+                    if c.knobs else "click the plot to add a knob")
+            p.drawText(QRectF(r.left() + 4, r.top() + 2, r.width() - 8, 14), hint)
         p.end()
 
     # -- dragging -------------------------------------------------------------
     def _handle_at(self, pos: QPointF) -> int:
-        for i, (t, pwm) in enumerate(((self.curve.mintemp, self.curve.minpwm),
-                                      (self.curve.maxtemp, self.curve.maxpwm))):
+        for i, (t, pwm) in enumerate(self._handles()):
             d = self._to_px(t, pwm) - pos
             if d.manhattanLength() <= HANDLE_R * 2.2:  # x+y close enough near the center
                 return i
         return -1
 
+    def _add_knob(self, pos: QPointF) -> None:
+        """Insert a knob under the cursor, converting a native curve first. The
+        new pwm is clamped between its neighbours because Curve.validate
+        rejects a curve that falls with temperature."""
+        t, pwm = self._from_px(pos)
+        t = int(round(max(TEMP_LO + 1, min(t, TEMP_HI - 1))))
+        pwm = int(round(max(0, min(pwm, PWM_MAX))))
+        k = list(self.curve.as_knobs())
+        if len(k) >= MAX_KNOBS:
+            return
+        # Knob temperatures are whole degrees, so a click can land on one a knob
+        # already owns. Take the nearest free degree instead of dropping the
+        # click: the user asked for a knob here, not for nothing to happen.
+        taken = {kt for kt, _ in k}
+        if t in taken:
+            free = [c for d in range(1, 4) for c in (t - d, t + d)
+                    if c not in taken and TEMP_LO < c < TEMP_HI]
+            if not free:
+                return
+            t = free[0]
+        k.append((t, pwm))
+        k.sort()
+        i = k.index((t, pwm))
+        lo = k[i - 1][1] if i else 0
+        hi = k[i + 1][1] if i + 1 < len(k) else PWM_MAX
+        k[i] = (t, max(lo, min(pwm, hi)))
+        self._drag = i                  # the same gesture keeps dragging it
+        self._apply_edit(replace(self.curve, knobs=tuple(k)))
+
+    def _remove_knob(self, i: int) -> None:
+        k = self.curve.knobs
+        if len(k) <= 2:                 # a curve still needs two end knobs
+            return
+        self._apply_edit(replace(self.curve, knobs=k[:i] + k[i + 1:]))
+
     def mousePressEvent(self, e: QMouseEvent) -> None:  # noqa: N802
-        if e.button() == Qt.MouseButton.LeftButton and not self._auto:
-            self._drag = self._handle_at(e.position())
+        if self._auto:
+            return
+        i = self._handle_at(e.position())
+        if e.button() == Qt.MouseButton.RightButton:
+            if i >= 0 and self.curve.knobs:
+                self._remove_knob(i)
+        elif e.button() == Qt.MouseButton.LeftButton:
+            if i >= 0:
+                self._drag = i
+            elif self._plot().contains(e.position()):
+                self._add_knob(e.position())
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:  # noqa: N802
+        if self._drag >= len(self._handles()):
+            self._drag = -1             # the knob under the cursor was removed
         if self._drag < 0:
-            hov = self._handle_at(e.position())
+            hov = -1 if self._auto else self._handle_at(e.position())
             self.setCursor(Qt.CursorShape.SizeAllCursor if hov >= 0
                            else Qt.CursorShape.ArrowCursor)
+            if hov != self._hover:
+                self._hover = hov
+                self.update()
             return
         t, pwm = self._from_px(e.position())
         pwm = int(round(pwm / 2) * 2)
         t = int(round(t))
         c = self.curve
-        if self._drag == 0:
+        if c.knobs:
+            # Each knob stays between its neighbours in both axes, so the
+            # curve validate() accepts cannot be dragged into an illegal one.
+            k, i = list(c.knobs), self._drag
+            t_lo = k[i - 1][0] + 1 if i else TEMP_LO
+            t_hi = k[i + 1][0] - 1 if i + 1 < len(k) else TEMP_HI
+            p_lo = k[i - 1][1] if i else 0
+            p_hi = k[i + 1][1] if i + 1 < len(k) else PWM_MAX
+            k[i] = (max(t_lo, min(t, t_hi)), max(p_lo, min(pwm, p_hi)))
+            self._apply_edit(replace(c, knobs=tuple(k)))
+        elif self._drag == 0:
             t = max(25, min(t, c.maxtemp - 5))
             pwm = max(0, min(pwm, c.minstop))
             self._apply_edit(replace(c, mintemp=t, minpwm=pwm))
@@ -219,8 +329,14 @@ class CurveWidget(QWidget):
 
     def mouseReleaseEvent(self, _e: QMouseEvent) -> None:  # noqa: N802
         self._drag = -1
+        self.update()
 
-    _auto = False  # set by the window when EC mode is on
+    def leaveEvent(self, _e) -> None:  # noqa: N802
+        # Without this the readout of the last hovered handle stays painted
+        # after the pointer has left the plot.
+        if self._hover != -1:
+            self._hover = -1
+            self.update()
 
     def _apply_edit(self, curve: Curve) -> None:
         if curve != self.curve:
@@ -295,7 +411,7 @@ class MainWindow(QWidget):
 
         # numeric editor
         edit_box = QGroupBox("Curve")
-        form = QFormLayout(edit_box)
+        form = self.form = QFormLayout(edit_box)
         self.spin: dict[str, QSpinBox] = {}
         self.form_labels: dict[str, QLabel] = {}
 
@@ -327,6 +443,16 @@ class MainWindow(QWidget):
                           ("interval", "Sample interval"),
                           ("average", "Temp averaging")):
             self.form_labels[key].setText(text)
+
+        # Knob mode retires MINTEMP..MAXPWM (they become the fixed transfer
+        # calibration), so the row says which mode the curve is in and offers
+        # the way back. Inserted first so it reads as a header for the spins.
+        self.knob_label = QLabel()
+        self.btn_two_point = QPushButton("Back to 2-point")
+        self.btn_two_point.setToolTip(
+            "Drop the knobs and edit MINTEMP/MAXTEMP again (discards the knob curve)")
+        self.btn_two_point.clicked.connect(self.on_two_point)
+        form.insertRow(0, self.knob_label, self.btn_two_point)
         side.addWidget(edit_box)
 
         # service / apply
@@ -390,6 +516,8 @@ class MainWindow(QWidget):
             average=self.spin["average"].value(),
             label=self.dirty_label,
             ignore_cap=self.active_preset == "turbo",
+            # The canvas owns the knobs; the spin boxes have no row for them.
+            knobs=self.canvas.curve.knobs,
         )
 
     def editor_from_curve(self, c: Curve, mark_preset: str | None = None) -> None:
@@ -405,6 +533,33 @@ class MainWindow(QWidget):
         self.canvas.blockSignals(False)
         for name, btn in self.preset_buttons.items():
             btn.setChecked(name == mark_preset)
+        self.sync_knob_ui()
+
+    def sync_knob_ui(self) -> None:
+        """Enable only the spin boxes that mean something in the current mode.
+        In knob mode MINTEMP..MAXPWM hold fancore.KNOB_XFER, so their rows are
+        hidden: editing them would change nothing the fan can feel."""
+        knobs = self.canvas.curve.knobs
+        auto = self.rb_auto.isChecked()
+        # In knob mode these five hold KNOB_XFER, which the spin ranges clamp
+        # into numbers that mean nothing. Hide the rows instead of greying a
+        # wrong value. MINSTART, INTERVAL and AVERAGE still apply, so they stay.
+        for key in ("mintemp", "maxtemp", "minpwm", "minstop", "maxpwm"):
+            self.form.setRowVisible(self.spin[key], not knobs)
+            self.spin[key].setEnabled(not auto)
+        self.btn_two_point.setEnabled(not auto and bool(knobs))
+        self.knob_label.setText(f"{len(knobs)} knobs / {MAX_KNOBS}" if knobs
+                                else "2-point ramp")
+        # The curve as text, which is also how it lands in the config comment.
+        # A count alone leaves no way to read a knob back off the chart.
+        self.knob_label.setToolTip(" ".join(f"{t}:{v}" for t, v in knobs)
+                                   if knobs else "")
+
+    def on_two_point(self) -> None:
+        c = self.canvas.curve
+        self.editor_from_curve(replace(c, knobs=()), self.active_preset)
+        self._dirty = True
+        self.result.setText("knobs dropped — Apply to activate the 2-point ramp")
 
     def load_presets(self) -> dict[str, Curve]:
         try:
@@ -458,13 +613,14 @@ class MainWindow(QWidget):
         fans = "  ".join(f"fan{i+1} {r if r is not None else 'n/a'} RPM"
                           for i, r in enumerate(s.rpms))
         pwms = "  ".join(f"pwm{i+1} {pwm_percent(v)}" for i, v in enumerate(s.pwms))
-        mode = {1: "manual", 2: "EC auto"}.get((s.pwm_enables or (None,))[0], "n/a")
+        enable = next((e for e in s.pwm_enables if e is not None), None)
+        mode = {1: "manual", 2: "EC auto"}.get(enable, "n/a")
         self.status.setText(f"CPU {temp_txt}    {fans}    {pwms}    mode {mode}")
         live_pwm = next((v for v in s.pwms if v is not None), None)
         self.canvas.set_live(s.cpu_temp_c, live_pwm)
         # If the EC took over (or fancontrol grabbed the fan) outside this app,
         # follow the mode — unless the user has unsaved edits.
-        live_auto = next((e for e in s.pwm_enables if e is not None), None) == 2
+        live_auto = enable == 2
         if not self._dirty and live_auto != self.rb_auto.isChecked():
             self._radio_sync = True
             self.rb_auto.setChecked(live_auto)
@@ -497,6 +653,7 @@ class MainWindow(QWidget):
             sb.setEnabled(not auto)
         for name, btn in self.preset_buttons.items():
             btn.setEnabled(not auto and name in self.presets)
+        self.sync_knob_ui()
         self.canvas.update()
 
     def on_preset(self, name: str) -> None:
@@ -523,6 +680,9 @@ class MainWindow(QWidget):
         for btn in self.preset_buttons.values():
             btn.setChecked(False)
         c = self.canvas.curve
+        if c.knobs:
+            self.sync_knob_ui()   # a knob edit moves no spin box, only the count
+            return
         for key in ("mintemp", "maxtemp", "minpwm", "maxpwm"):
             sb = self.spin[key]
             sb.blockSignals(True)
@@ -530,13 +690,18 @@ class MainWindow(QWidget):
             sb.blockSignals(False)
 
     def _ensure_watches(self) -> None:
-        # mv-based atomic replace drops the watch; re-add on every (re)load
-        for path in (self.args.config, self.args.cap):
-            if os.path.exists(path) and path not in self.watcher.files():
+        # mv-based atomic replace drops the watch; re-add on every (re)load.
+        # kdeglobals is watched for the same reason: KDE rewrites it in place
+        # when the colour scheme changes, and the watch does not survive that.
+        for path in (self.args.config, self.args.cap, ktheme.kdeglobals()):
+            if path and os.path.exists(path) and path not in self.watcher.files():
                 self.watcher.addPath(path)
 
     def on_watched_changed(self, path: str) -> None:
         self._ensure_watches()
+        if path == ktheme.kdeglobals():
+            self.retheme()
+            return
         if path == self.args.cap:
             self.cap = read_cap(self.args.cap)
             self.canvas.cap = self.cap
@@ -564,7 +729,13 @@ class MainWindow(QWidget):
             except ValueError as e:
                 QMessageBox.warning(self, "Invalid curve", str(e))
                 return
-            argv = [helper] + (["--ignore-cap"] if c.ignore_cap else []) + [
+            opts = ["--ignore-cap"] if c.ignore_cap else []
+            if c.knobs:
+                opts += ["--knobs", " ".join(f"{t}:{pwm}" for t, pwm in c.knobs)]
+                # The positionals become the transfer calibration; the curve
+                # itself travels in --knobs. See fancore.KNOB_XFER.
+                c = replace(c, **KNOB_XFER)
+            argv = [helper] + opts + [
                 str(c.interval), str(c.mintemp), str(c.maxtemp), str(c.minstart),
                 str(c.minstop), str(c.minpwm), str(c.maxpwm), str(c.average),
                 c.label]
@@ -598,12 +769,33 @@ class MainWindow(QWidget):
         else:
             self.result_warn(f"apply failed (rc={code}): {out or 'see journal'}")
 
+    def retheme(self) -> None:
+        """Re-resolve every scheme colour and repaint. Reached from the palette
+        event and from the kdeglobals watch; see ktheme.forget."""
+        ktheme.forget()
+        self.canvas.update()
+        self.update()
+
+    def changeEvent(self, e) -> None:  # noqa: N802
+        # Plasma switching the colour scheme reaches a running Qt app as an
+        # app-wide palette change, and Qt turns that into PaletteChange on every
+        # widget (ApplicationPaletteChange goes to event(), not here -- measured,
+        # see test_qt_still_delivers_a_palette_change_on_a_scheme_switch).
+        # Without this the chart keeps the colours it started with all session.
+        if e.type() == QEvent.Type.PaletteChange:
+            self.retheme()
+        super().changeEvent(e)
+
     def result_warn(self, msg: str) -> None:
         # Multiple problems stay visible (the label shows only the last one otherwise)
         current = self.result.text()
         text = msg if not current or msg in current else f"{current}\n{msg}"
-        self.result.setStyleSheet("color: #c0392b")
-        self.result.setText(text)
+        neg = ktheme.colors(self.palette()).negative
+        self.result.setStyleSheet(f"color: {neg.name()}")
+        # KDE HIG: colour must not be the only carrier of meaning, so the text
+        # says it is an error too. Red alone is invisible to a dichromat.
+        self.result.setText(text if text.startswith(ERROR_PREFIX)
+                            else f"{ERROR_PREFIX}{text}")
         QTimer.singleShot(4000, lambda: self.result.setStyleSheet(""))
 
 
@@ -623,25 +815,48 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def dark_palette() -> QPalette:
+    """Breeze Dark for a session that supplies no palette: the offscreen
+    renders and any non-Plasma desktop run with --dark. On Plasma the platform
+    theme already carries the user's scheme, so this is never applied there.
+    Values are BreezeDark.colors: Window/View/Button/Selection BackgroundNormal
+    and ForegroundNormal."""
     pal = QPalette()
-    base, window, text, hi = QColor("#232629"), QColor("#2b2f33"), QColor("#e6e6e6"), QColor("#3daee9")
-    for role in (QPalette.ColorRole.Base, QPalette.ColorRole.AlternateBase):
-        pal.setColor(role, base)
-    for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Button):
-        pal.setColor(role, window)
+    base, window = QColor(20, 22, 24), QColor(32, 35, 38)
+    button, text, hi = QColor(41, 44, 48), QColor(252, 252, 252), QColor(61, 174, 233)
+    pal.setColor(QPalette.ColorRole.Base, base)
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(29, 31, 34))
+    pal.setColor(QPalette.ColorRole.Window, window)
+    pal.setColor(QPalette.ColorRole.Button, button)
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
                  QPalette.ColorRole.ButtonText):
         pal.setColor(role, text)
     pal.setColor(QPalette.ColorRole.Highlight, hi)
-    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(252, 252, 252))
+    # setColor() without a group sets every group, so the disabled text came
+    # out equal to the normal text and ktheme's inactive fallback collapsed
+    # onto it. BreezeDark ForegroundInactive is the value the scheme would
+    # have supplied.
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                 QPalette.ColorRole.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(161, 169, 177))
     return pal
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     app = QApplication(sys.argv[:1])
+    # No setStyle(): the platform theme picks Breeze on a Plasma session, and
+    # forcing Fusion there is exactly what made this look unthemed. The
+    # renders pass --style explicitly instead (tests/render_app.py).
+    app.setApplicationName(DESKTOP_FILE)
+    # Same string as the window title and the launcher entry's Name. Qt shows
+    # this in task switchers, so a third variant would be a third name for one
+    # app. The System Settings entry is "Fan Control" on purpose: it is already
+    # inside a settings context.
+    app.setApplicationDisplayName("Juno Fan Control")
+    app.setDesktopFileName(DESKTOP_FILE)
+    app.setWindowIcon(QIcon.fromTheme(APP_ICON))
     if args.dark:
-        app.setStyle("fusion")
         app.setPalette(dark_palette())
     w = MainWindow(args)
     w.show()
