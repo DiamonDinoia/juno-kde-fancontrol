@@ -1,3 +1,81 @@
+juno-kde-fancontrol (0.3.0+diamon1) unstable; urgency=low
+
+  * Multi-point fan curves ("knobs"): click the plot in the editor to add a
+    control point, drag any knob, right-click to remove one, up to 16.
+  * New /usr/bin/juno-fan-curve, the executable FCTEMPS source behind them.
+    fancontrol interpolates one linear segment only, so the knob curve lives in
+    a `# Knobs:` comment, the MIN/MAX keys become a fixed transfer calibration
+    and juno-fan-curve reports the commanded PWM as a virtual temperature that
+    the calibrated segment maps back to itself exactly. A non-zero exit from
+    the helper still lands in fancontrol's restorefans path, so a failure hands
+    the fans to the EC rather than to a wrong curve.
+  * fan-profile: regen carries a knob curve through a hwmon index change
+    untouched, status prints the knobs instead of the calibration, and the
+    calibrated noise cap is applied to the knobs rather than to MAXPWM, where
+    it would have rescaled every commanded PWM by cap/255.
+  * juno-fancontrol-apply --knobs re-validates the whole knob list as root and
+    refuses --ignore-cap: regen re-applies the cap at every boot, so an
+    exemption would hold only until the next reboot.
+  * Both DEVNAME entries now come from sysfs in every writer. juno-fancontrol-apply
+    and fan-profile hardcoded this board's names, which on any variant reporting
+    a different hwmon name would have produced a config fancontrol silently
+    rejects on startup.
+  * juno-fan-curve reports a missing hwmon as one line instead of a Python
+    traceback; the first call after a resume can land before clevofan
+    re-registers. The exit stays non-zero, so fancontrol still falls back.
+  * A click that lands on a degree a knob already owns now adds the knob at the
+    nearest free degree instead of being silently dropped.
+  * The editor appears in System Settings, under System beside Power Management,
+    as an external module (juno-fancontrol-settings.desktop under
+    /usr/share/plasma/systemsettings/externalmodules). Verified against
+    systemsettings 6.7.4, which lists it through the same findExternalKCMModules
+    path it uses to build its own sidebar.
+  * Both GUIs now take every colour from the active KDE colour scheme
+    (backend/ktheme.py): the noise cap uses ForegroundNegative, the live marker
+    ForegroundPositive, the curve DecorationFocus, guides and hints
+    ForegroundInactive, and the tray series the same three accents. Nothing is
+    hardcoded any more, and neither GUI forces the Fusion style over Breeze, so
+    a scheme switch now moves the charts with the rest of the desktop.
+  * Changing the colour scheme while either GUI runs repaints it: the memoized
+    scheme read is dropped on Qt's PaletteChange and on a kdeglobals rewrite,
+    because the palette event can arrive before the scheme applier has finished
+    writing the file. The scheme file is parsed directly rather than through
+    QSettings, whose process-wide cache cannot see a same-size rewrite within
+    the same second.
+  * Secondary text (guides, hints) is held to a 3.0:1 contrast floor against the
+    window, so a scheme or a --dark override cannot make it illegible; 3.0 and
+    not WCAG's 4.5 for text, because BreezeLight's own ForegroundInactive scores
+    3.69 and a higher floor would override the default KDE scheme.
+  * Errors on the status line are marked with a symbol as well as the negative
+    colour, per the KDE HIG rule that colour must not be the only carrier of
+    meaning.
+  * Editor affordances: the handle under the pointer grows and takes the hover
+    colour, the handle in play shows its own "78 °C -> 47%" readout, and the
+    knob count carries the whole curve as a tooltip.
+  * The window, the launcher entry and the settings entry share one icon and one
+    desktop-file name, so Plasma matches the window to the application on
+    Wayland instead of falling back to a generic icon.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Mon, 31 Aug 2026 22:15:00 -0400
+
+juno-kde-fancontrol (0.2.0+diamon1) unstable; urgency=low
+
+  * The package now owns the whole fan stack: fan-profile and fan-calibrate
+    move to /usr/bin, the fancontrol drop-in (30-juno-fancontrol.conf) and the
+    suspend/resume hook ship with it. No hand-installed /usr/local pieces left.
+  * New juno-fan-monitor tray applet: CPU/GPU temperature, fan RPM and PWM,
+    network throughput, discrete-GPU power state, total system power, battery
+    runtime, and a rolling CPU/iGPU/dGPU utilization chart.
+  * fan-profile regen validates every key before rewriting the config; a
+    partial /etc/fancontrol is left alone instead of emitting an empty MINSTART
+    that fancontrol reads as 0.
+  * fan-profile regen no longer assumes two PWM channels; it globs the hwmon.
+  * Reject MINSTART < MINSTOP in both the GUI and the root helper: a kick-start
+    pulse below the stop threshold cannot restart a stopped fan.
+  * Ship the RAPL udev rule under /usr/share (not activated on install).
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Mon, 31 Aug 2026 20:30:00 -0400
+
 juno-kde-fancontrol (0.1.0+diamon1) unstable; urgency=low
 
   * Initial release: PySide6 fan-curve editor for Juno/Clevo laptops on top of

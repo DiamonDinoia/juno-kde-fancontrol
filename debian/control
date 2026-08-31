@@ -11,15 +11,37 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: ${misc:Depends},
-	python3-pyside6.qtwidgets,
+	python3-pyside6.qtwidgets (>= 6.4),
 	fancontrol,
 	pkexec,
-Description: KDE/Qt6 fan-curve editor for Juno (Clevo) laptops
- Live view of CPU temperature, fan RPM, and PWM duty with a draggable
- pwm = f(temp) curve chart matching the fancontrol control law. Presets are
- scraped from the fan-profile CLI so GUI and CLI never drift apart. Changes
- are applied through a root helper (pkexec/polkit) that writes /etc/fancontrol
- in fan-profile's byte format and restarts fancontrol.service, with automatic
- rollback if the daemon rejects the new config.
+Recommends: pipewire-bin,
+	pulseaudio-utils,
+	python3-numpy,
+Suggests: nvidia-smi,
+	systemsettings,
+Description: fan control and system monitor for Juno (Clevo) laptops
+ The whole fan stack for this laptop family in one package: the fan-profile
+ CLI (quiet/balanced/cool/turbo/auto), the systemd drop-in that re-resolves
+ drifting hwmon indices before fancontrol starts, the suspend/resume hook, a
+ KDE/Qt6 curve editor and a system-tray monitor.
  .
- Requires the fan-profile/fancontrol stack (juno system fixes) and clevofan.
+ The editor shows CPU temperature, fan RPM and PWM duty live, with a draggable
+ pwm = f(temp) chart matching the fancontrol control law. Clicking the plot adds
+ a control point, turning the two-handle preset into a multi-point curve that is
+ driven through an executable FCTEMPS source, since fancontrol itself
+ interpolates only one linear segment. Every colour in both GUIs comes from the
+ active KDE colour scheme, and the editor is reachable from System Settings as
+ well as from the launcher. Presets are scraped
+ from the fan-profile script itself so GUI and CLI cannot drift apart. Changes
+ go through a root helper (pkexec/polkit) that writes /etc/fancontrol in
+ fan-profile's byte format and restarts fancontrol.service, rolling back both
+ the file and the daemon if the new config is rejected.
+ .
+ The tray monitor reports CPU and GPU temperature, fan speed, network
+ throughput, discrete-GPU power state, total system power and battery runtime,
+ with a rolling CPU/iGPU/dGPU utilization chart.
+ .
+ Requires the clevofan driver. fan-calibrate (microphone-based PWM noise
+ calibration) needs the recommended pipewire-bin, pulseaudio-utils and
+ python3-numpy; the tray reads the discrete GPU through the suggested
+ nvidia-smi when one is present and awake.
