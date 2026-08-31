@@ -1,0 +1,54 @@
+name: build
+
+# Builds this repo's deb through the full container gate (unit tests,
+# privileged-helper integration, deb install verification, offscreen renders)
+# and attaches it to the `builds` release. The apt repository at
+# DiamonDinoia/apt republishes exactly these bytes, verified against the
+# digest GitHub reports for each asset, so the served package always matches
+# what this CI tested.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: debs
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The gate drives podman, not docker: rootless, and the same runtime the
+      # local runs use, so CI measures the same thing.
+      - name: Install podman
+        run: sudo apt-get update && sudo apt-get install -y podman
+
+      - name: Build and gate the package
+        run: ./tests/run-container.sh
+
+      - name: Publish the debs as release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view builds >/dev/null 2>&1 ||
+            gh release create builds --notes "Built debs. Do not delete."
+          for deb in tests/out/deb/*.deb; do
+            [ -f "$deb" ] || { echo "no debs built"; exit 1; }
+            gh release upload builds "$deb" --clobber
+            # The apt repository afterwards pins and serves whatever the
+            # upload left, so the upload has to equal the file the container
+            # gate just verified. Without this check a mangled upload is
+            # green here and hash-fails downstream, a day later.
+            remote=$(gh release view builds --json assets \
+              --jq ".assets[] | select(.name == \"$(basename "$deb")\") | .digest")
+            [ "$remote" = "sha256:$(sha256sum "$deb" | cut -d' ' -f1)" ] ||
+              { echo "FAIL  uploaded $(basename "$deb") hashes $remote, not the local bytes"; exit 1; }
+          done
