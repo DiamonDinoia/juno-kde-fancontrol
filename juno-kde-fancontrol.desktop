@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Juno Fan Control
+GenericName=Fan Curve Editor
+Comment=View and edit Clevo/Juno laptop fan curves (fancontrol backend)
+Exec=juno-kde-fancontrol
+Icon=preferences-system
+Categories=Settings;System;Qt;
+Keywords=fan;temperature;cooling;curve;sensors;
+StartupNotify=true

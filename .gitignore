@@ -1,0 +1,10 @@
+__pycache__/
+tests/out/
+dist/
+obj-*/
+org.juno.kdefancontrol.policy
+/.pc/
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/juno-kde-fancontrol/

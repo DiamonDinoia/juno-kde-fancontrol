@@ -1,0 +1,7 @@
+juno-kde-fancontrol (0.1.0+diamon1) unstable; urgency=low
+
+  * Initial release: PySide6 fan-curve editor for Juno/Clevo laptops on top of
+    fan-profile + fancontrol.service. Draggable curve chart, live sensors,
+    presets scraped from fan-profile, pkexec apply with rollback.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Mon, 31 Aug 2026 16:00:00 -0400

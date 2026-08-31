@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+# Custom (non-preset) curves survive restarts only if fan-profile's regen
+# keeps unknown labels instead of failing the ExecStartPre chain. The deb
+# does not own /usr/local/bin/fan-profile (it comes from the juno system
+# fixes), so warn instead of touching it.
+if [[ -x /usr/local/bin/fan-profile ]] && ! grep -q regen_custom /usr/local/bin/fan-profile; then
+    cat >&2 <<'EOF'
+juno-kde-fancontrol: WARNING
+  /usr/local/bin/fan-profile is the pre-fix version: its `regen` ExecStartPre
+  hook rejects non-preset labels, so custom curves from this GUI would roll
+  back at every service restart. Update it once with:
+    sudo install -m755 ~/system-fixes/fan-profile /usr/local/bin/fan-profile
+  (preset buttons Quiet/Balanced/Cool/Turbo work regardless.)
+EOF
+fi
+
+#DEBHELPER#
+
+exit 0

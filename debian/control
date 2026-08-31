@@ -1,0 +1,25 @@
+Source: juno-kde-fancontrol
+Section: utils
+Priority: optional
+Build-Depends: debhelper-compat (= 13)
+Maintainer: Marco Barbone <mbarbone@flatironinstitute.org>
+Standards-Version: 4.6.2
+Homepage: https://github.com/DiamonDinoia/juno-kde-fancontrol
+
+Package: juno-kde-fancontrol
+Section: utils
+Priority: optional
+Architecture: all
+Depends: ${misc:Depends},
+	python3-pyside6.qtwidgets,
+	fancontrol,
+	pkexec,
+Description: KDE/Qt6 fan-curve editor for Juno (Clevo) laptops
+ Live view of CPU temperature, fan RPM, and PWM duty with a draggable
+ pwm = f(temp) curve chart matching the fancontrol control law. Presets are
+ scraped from the fan-profile CLI so GUI and CLI never drift apart. Changes
+ are applied through a root helper (pkexec/polkit) that writes /etc/fancontrol
+ in fan-profile's byte format and restarts fancontrol.service, with automatic
+ rollback if the daemon rejects the new config.
+ .
+ Requires the fan-profile/fancontrol stack (juno system fixes) and clevofan.

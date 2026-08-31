@@ -1,0 +1,6 @@
+app.py usr/lib/juno-kde-fancontrol/
+backend usr/lib/juno-kde-fancontrol/
+juno-fancontrol-apply usr/sbin/
+scripts/juno-kde-fancontrol usr/bin/
+juno-kde-fancontrol.desktop usr/share/applications/
+org.juno.kdefancontrol.policy usr/share/polkit-1/actions/

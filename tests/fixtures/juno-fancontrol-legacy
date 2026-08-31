@@ -1,0 +1,12 @@
+INTERVAL=60
+DEVPATH=hwmon9=devices/platform/clevofan hwmon10=devices/platform/coretemp.0
+DEVNAME=hwmon9=V5xTNC_TND_TNE hwmon10=coretemp
+FCTEMPS=hwmon9/pwm1=hwmon10/temp1_input hwmon9/pwm2=hwmon10/temp1_input
+FCFANS=hwmon9/pwm1=hwmon9/fan1_input hwmon9/pwm2=hwmon9/fan2_input
+MINTEMP=hwmon9/pwm1=75 hwmon9/pwm2=75
+MAXTEMP=hwmon9/pwm1=92 hwmon9/pwm2=92
+MINSTART=hwmon9/pwm1=150 hwmon9/pwm2=150
+MINSTOP=hwmon9/pwm1=51 hwmon9/pwm2=51
+MINPWM=hwmon9/pwm1=0 hwmon9/pwm2=0
+MAXPWM=hwmon9/pwm1=206 hwmon9/pwm2=206
+AVERAGE=hwmon9/pwm1=4 hwmon9/pwm2=4

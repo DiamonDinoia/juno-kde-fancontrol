@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# juno-fancontrol-apply — privileged backend for juno-kde-fancontrol.
+#
+# Runs as root (via pkexec). Writes a fancontrol config byte-compatible with
+# fan-profile's write_curve and restarts fancontrol.service. Keeps the same
+# on-disk format so `fan-profile status` and `fancontrol --check` keep working
+# on the result.
+#
+# Usage:
+#   juno-fancontrol-apply --auto                        # hand fans to the EC
+#   juno-fancontrol-apply [--ignore-cap] INTERVAL MINTEMP MAXTEMP MINSTART \
+#                         MINSTOP MINPWM MAXPWM AVERAGE LABEL
+#
+# Test hooks (pkexec scrubs the environment, so these never leak into
+# production use): JFC_PLATFORM_DIR JFC_FANCONFIG JFC_CAP_FILE JFC_SYSTEMCTL
+# JFC_FANCONTROL JFC_FAN_PROFILE JFC_NOW NO_RESTART
+set -euo pipefail
+
+PLATFORM_DIR="${JFC_PLATFORM_DIR:-/sys/devices/platform}"
+FANCONFIG="${JFC_FANCONFIG:-/etc/fancontrol}"
+CAP_FILE="${JFC_CAP_FILE:-/etc/fan-profile.maxpwm}"
+SYSTEMCTL="${JFC_SYSTEMCTL:-systemctl}"
+FANCONTROL="${JFC_FANCONTROL:-/usr/sbin/fancontrol}"
+FAN_PROFILE="${JFC_FAN_PROFILE:-/usr/local/bin/fan-profile}"
+NOW="${JFC_NOW:-$(date '+%Y-%m-%d %H:%M')}"
+
+die() { echo "juno-fancontrol-apply: $*" >&2; exit 1; }
+
+usage() {
+    echo "usage: juno-fancontrol-apply --auto" >&2
+    echo "   or: juno-fancontrol-apply [--ignore-cap] INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM AVERAGE LABEL" >&2
+    exit 64
+}
+
+IGNORE_CAP=0
+[[ "${1:-}" == "--ignore-cap" ]] && { IGNORE_CAP=1; shift; }
+
+if [[ "${1:-}" == "--auto" ]]; then
+    exec "$FAN_PROFILE" auto
+fi
+
+[[ $# -eq 9 ]] || usage
+INTERVAL="$1"; MINTEMP="$2"; MAXTEMP="$3"; MINSTART="$4"; MINSTOP="$5"
+MINPWM="$6"; MAXPWM="$7"; AVERAGE="$8"; LABEL="$9"
+
+# --- validate (same rules as fancore.Curve.validate; fancontrol rejects bad configs) ---
+for v in "$INTERVAL" "$MINTEMP" "$MAXTEMP" "$MINSTART" "$MINSTOP" "$MINPWM" "$MAXPWM" "$AVERAGE"; do
+    [[ "$v" =~ ^[0-9]+$ ]] || die "non-numeric argument '$v'"
+done
+(( INTERVAL >= 1 && INTERVAL <= 60 )) || die "INTERVAL must be 1..60"
+(( MINTEMP < MAXTEMP ))               || die "MINTEMP ($MINTEMP) must be < MAXTEMP ($MAXTEMP)"
+(( MINPWM <= MINSTOP ))               || die "MINPWM ($MINPWM) must be <= MINSTOP ($MINSTOP)"
+(( MINSTOP < MAXPWM ))                || die "MINSTOP ($MINSTOP) must be < MAXPWM ($MAXPWM)"
+(( MINSTART <= 255 && MINSTOP <= 255 && MAXPWM <= 255 )) || die "pwm values must be <= 255"
+(( AVERAGE >= 1 && AVERAGE <= 16 ))   || die "AVERAGE must be 1..16"
+[[ "$LABEL" =~ ^[a-z0-9-]+$ ]]        || die "bad label '$LABEL'"
+
+# --- resolve hwmon indices fresh (they drift between boots — never cache hwmonN) ---
+resolve_hw() {
+    local d
+    d=$(ls -d "$PLATFORM_DIR/$1"/hwmon/hwmon* 2>/dev/null | head -1) || true
+    [[ -n "$d" ]] && basename "$d"
+}
+FANHW=$(resolve_hw clevofan)    || die "clevofan hwmon not found under $PLATFORM_DIR"
+TEMPHW=$(resolve_hw coretemp.0) || die "coretemp hwmon not found under $PLATFORM_DIR"
+HWMON_DIR="$PLATFORM_DIR/clevofan/hwmon/$FANHW"
+
+PWMS=()
+for p in "$HWMON_DIR"/pwm[0-9]; do
+    [[ -e "$p" ]] && PWMS+=("$(basename "$p")")
+done
+((${#PWMS[@]} >= 1)) || die "$FANHW exposes no pwmN files"
+
+# fancontrol sanitizes device names (sed 's/[[:space:]=]/_/g') before matching
+# DEVNAME — emit the same form.
+FAN_DEVNAME=$(sed 's/[[:space:]=]/_/g' < "$HWMON_DIR/name")
+
+# --- calibrated noise cap (fan-profile semantics: everything but turbo honors it) ---
+if [[ "$IGNORE_CAP" != 1 && -f "$CAP_FILE" ]]; then
+    CAP=$(tr -dc '0-9' < "$CAP_FILE")
+    if [[ -n "$CAP" ]] && (( MAXPWM > CAP )); then
+        echo "clamping MAXPWM $MAXPWM -> $CAP (calibrated noise cap)"
+        MAXPWM="$CAP"
+    fi
+fi
+
+# --- emit config, byte-identical to fancore.render_config / fan-profile write_curve ---
+case "$LABEL" in quiet|balanced|cool|turbo) HINT="$LABEL" ;; *) HINT="quiet" ;; esac
+
+join_by() { local IFS=' '; echo "$*"; }
+pair() { # pair KEY VALUE -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=VALUE ..."
+    local key="$1" val="$2" out=() pwm
+    for pwm in "${PWMS[@]}"; do out+=("$FANHW/$pwm=$val"); done
+    echo "$key=$(join_by "${out[@]}")"
+}
+
+FCTEMPS=(); FCFANS=()
+for pwm in "${PWMS[@]}"; do
+    FCTEMPS+=("$FANHW/$pwm=$TEMPHW/temp1_input")
+    FCFANS+=("$FANHW/$pwm=$FANHW/fan${pwm#pwm}_input")
+done
+
+TMP="${FANCONFIG}.tmp.$$"
+trap 'rm -f "$TMP"' EXIT
+{
+    echo "# Managed by fan-profile ($LABEL) — $NOW"
+    echo "# Edit MIN/MAX values then run: fancontrol or fan-profile $HINT"
+    echo "INTERVAL=$INTERVAL"
+    echo "DEVPATH=$FANHW=devices/platform/clevofan $TEMPHW=devices/platform/coretemp.0"
+    echo "DEVNAME=$FANHW=$FAN_DEVNAME $TEMPHW=coretemp"
+    echo "FCTEMPS=$(join_by "${FCTEMPS[@]}")"
+    echo "FCFANS=$(join_by "${FCFANS[@]}")"
+    pair MINTEMP "$MINTEMP"
+    pair MAXTEMP "$MAXTEMP"
+    pair MINSTART "$MINSTART"
+    pair MINSTOP "$MINSTOP"
+    pair MINPWM "$MINPWM"
+    pair MAXPWM "$MAXPWM"
+    pair AVERAGE "$AVERAGE"
+} > "$TMP"
+chmod 644 "$TMP"
+
+[[ -f "$FANCONFIG" ]] && cp -f "$FANCONFIG" "${FANCONFIG}.bak"
+mv "$TMP" "$FANCONFIG"
+trap - EXIT
+
+restore() {
+    [[ -f "${FANCONFIG}.bak" ]] && mv -f "${FANCONFIG}.bak" "$FANCONFIG"
+    # Rollback is only complete once the old daemon is back up; `stop` already
+    # ran as part of the failed restart, so start explicitly.
+    "$SYSTEMCTL" start fancontrol.service >/dev/null 2>&1 || true
+    if "$SYSTEMCTL" is-active --quiet fancontrol.service; then
+        die "$1 (restored previous config; fancontrol running)"
+    fi
+    die "$1 (config restored on disk, but fancontrol is DOWN — check: systemctl status fancontrol)"
+}
+
+"$FANCONTROL" --check "$FANCONFIG" >/dev/null 2>&1 \
+    || restore "fancontrol --check rejected the new config"
+
+echo "wrote $FANCONFIG ($LABEL): ${MINTEMP}C..${MAXTEMP}C pwm ${MINPWM}..${MAXPWM} on $FANHW/$TEMPHW (${#PWMS[@]} fan(s))"
+
+# --- (re)start the daemon (NO_RESTART: fan-profile regen semantics) ---
+if [[ "${NO_RESTART:-0}" != "1" ]]; then
+    "$SYSTEMCTL" disable --now clevofan-auto.service >/dev/null 2>&1 || true
+    "$SYSTEMCTL" enable fancontrol.service >/dev/null 2>&1 || true
+    # `|| restore`, not bare: under set -e a failing restart would otherwise
+    # kill the script before the rollback could run.
+    if ! "$SYSTEMCTL" restart fancontrol.service; then
+        "$SYSTEMCTL" status fancontrol.service --no-pager >&2 || true
+        restore "fancontrol.service failed to restart with the new config"
+    fi
+    sleep 1
+    if ! "$SYSTEMCTL" is-active --quiet fancontrol.service; then
+        "$SYSTEMCTL" status fancontrol.service --no-pager >&2 || true
+        restore "fancontrol.service failed to start with the new config"
+    fi
+    echo "fancontrol.service active"
+fi

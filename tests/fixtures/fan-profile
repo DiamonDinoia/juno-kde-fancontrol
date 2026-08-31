@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Excerpt of /usr/local/bin/fan-profile (profile table only), captured
+# 2026-08-31 for hermetic tests. The GUI parses the live script at runtime;
+# this fixture keeps the container tests independent of the host file.
+apply_fancontrol() { :; }
+apply_auto() { :; }
+usage() { :; }
+case "$PROFILE" in
+    quiet)    apply_fancontrol 10  60   95    70     50    0     120 ;;
+    balanced) apply_fancontrol 10  55   90    60     45    40    255 ;;
+    cool)     apply_fancontrol 10  45   80    60     60    60    255 ;;
+    turbo)    apply_fancontrol 5   40   80    100    100   100   255  0 ;;
+    auto)     apply_auto ;;
+    *) echo "fan-profile: unknown profile '$PROFILE'" >&2; usage; exit 1 ;;
+esac

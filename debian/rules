@@ -1,0 +1,13 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_install:
+	sed 's|@HELPER@|/usr/sbin/juno-fancontrol-apply|' org.juno.kdefancontrol.policy.in \
+	    > org.juno.kdefancontrol.policy
+	dh_install
+
+override_dh_clean:
+	dh_clean
+	rm -f org.juno.kdefancontrol.policy
