@@ -31,7 +31,7 @@ exec 9>"$LOCK" || exit 1
 flock -n 9 || { echo "another sweep holds $LOCK -- refusing to run"; exit 1; }
 BK=$(mktemp -d)
 OUT=$(mktemp -d)
-FILES=(backend/fancore.py backend/ktheme.py juno-fancontrol-apply fan-profile app.py fancurve.py tray.py)
+FILES=(backend/fancore.py backend/ktheme.py backend/sysmon.py juno-fancontrol-apply fan-profile app.py fancurve.py tray.py)
 save()    { for f in "${FILES[@]}"; do mkdir -p "$BK/$(dirname "$f")"; cp "$f" "$BK/$f"; done; }
 restore() { find . -name __pycache__ -type d -prune -exec rm -rf {} + ; for f in "${FILES[@]}"; do cp "$BK/$f" "$f"; done; }
 trap 'restore; rm -rf "$BK" "$OUT"; echo "[trap] tree restored"' EXIT
@@ -97,19 +97,19 @@ echo "== mutations (each line: failing pytest ids | failing shell tags)"
 mutate M1-knob-slope backend/fancore.py \
     's|(temp_c - t0) \* (p1 - p0) // (t1 - t0) + p0|(temp_c - t0) * (p1 - p0) // (t1 - t0 + 1) + p0|'
 mutate M2-drop-bang-source backend/fancore.py \
-    's|fctemps = " ".join(f"{f}/{p}=!{fan_curve}" for p in hw.pwms)|fctemps = " ".join(f"{f}/{p}={t}/{hw.temp_input}" for p in hw.pwms)|'
+    's|return f"!{fan_curve}" if c.knobs else f"{t}/{hw.temp_input}"|return f"{t}/{hw.temp_input}"|'
 mutate M3-step-above-mintemp backend/fancore.py \
     's|k.append((self.mintemp - 1, self.minpwm))|k.append((self.mintemp + 1, self.minpwm))|'
 mutate M4-drop-falling-check juno-fancontrol-apply \
     '/knob pwm must not fall/d'
 mutate M5-regen-clamps-xfer fan-profile \
-    '/\[\[ -n "$KNOB_LINE" \]\] && clamp=0/d'
+    '/\[\[ -n "$KNOB_CPU" \]\] && clamp=0/d'
 mutate M6-drop-insert-clamp app.py \
     's|k\[i\] = (t, max(lo, min(pwm, hi)))|k[i] = (t, pwm)|'
 mutate M7-regen-loses-bang fan-profile \
     's|temps+=("$FANHW/$p=!$KNOB_HELPER")|temps+=("$FANHW/$p=$TEMPHW/temp1_input")|'
 mutate M8-drop-knob-cap fan-profile \
-    '/\[\[ -n "$KNOB_LINE" \]\] && cap_knobs/d'
+    '/\[\[ -n "$KNOB_CPU" \]\] && cap_knobs/d'
 mutate M9-drop-drag-clamp app.py \
     's|k\[i\] = (max(t_lo, min(t, t_hi)), max(p_lo, min(pwm, p_hi)))|k[i] = (t, pwm)|'
 mutate M10-knob-validate-off backend/fancore.py \
@@ -166,6 +166,45 @@ pymutate M26-tray-hint-not-retheme tray.py \
     '        sheet = f"color: {ktheme.colors(self.palette()).inactive.name()}"
         if sheet != self.hint.styleSheet():
             self.hint.setStyleSheet(sheet)' '        pass'
+
+# --- the GPU fan ---
+# The never-wake ordering lives in read_dgpu: query the power state first and
+# only talk to the card when it answers "active".
+pymutate M27-gpu-wakes-when-suspended backend/sysmon.py \
+    '    if runtime != "active":
+        return Dgpu(present=True, powered=False, state=f"{runtime} ({power_state})".strip())
+' ''
+# A broken nvidia-smi dropping to coretemp is what keeps the daemon out of
+# restorefans forever; removing the fallback must break the fallback test.
+pymutate M28-gpu-smi-failure-aborts backend/fancore.py \
+    '    try:
+        temp = read_sensors(discover(platform_dir), platform_dir).cpu_temp_c
+    except HwmonNotFound:
+        temp = None
+    if temp is None:
+        raise HwmonNotFound("nvidia-smi gave no temperature, coretemp also unreadable")
+    return int(round(temp * 1000))' \
+    '    raise HwmonNotFound("nvidia-smi gave no temperature")'
+# The pwm2 knob read must come from the pwm2 line; fan1's line is a different
+# curve on a hotter sensor.
+mutate M29-gpu-curve-reads-pwm1 fancurve.py \
+    's|pwm = CPU_PWM if args.fan == "cpu" else GPU_PWM|pwm = CPU_PWM|'
+# The split source emit: pwm2 in knob mode belongs to the gpu helper.
+mutate M30-apply-gpu-on-cpu-helper juno-fancontrol-apply \
+    's|FCTEMPS+=("$FANHW/$pwm=!$GPU_CURVE")|FCTEMPS+=("$FANHW/$pwm=!$FAN_CURVE")|'
+# regen caps both knob lines, or the GPU fan outshouts the calibrated cap.
+mutate M31-regen-skips-gpu-cap fan-profile \
+    '/\[\[ -z "$KNOB_GPU" \]\] || KNOB_GPU=$(cap_line "$KNOB_GPU" "$cap")/d'
+# On a dGPU machine the CPU curve alone is a wrong curve for pwm2; the helper
+# must say so, not write it.
+mutate M32-apply-allows-half-split juno-fancontrol-apply \
+    '/|| die "this machine has a dGPU: knob mode needs --gpu-knobs too, or pwm2 would follow the CPU temperature"/d'
+# The renderer refusing to carry the GPU line would downgrade a dual config to
+# the CPU curve on the next write.
+pymutate M33-render-drops-gpu-knobs backend/fancore.py \
+    '        if gpu_curve is not None:
+            head.append(knobs_line(gpu_curve.knobs, GPU_PWM))
+' ''
 
 restore
 echo "== after restore: $(run)"

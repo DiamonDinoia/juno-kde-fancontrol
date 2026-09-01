@@ -1,3 +1,25 @@
+juno-kde-fancontrol (0.4.0+diamon1) unstable; urgency=low
+
+  * The GPU fan gets its own curve on dGPU machines. pwm1 keeps the CPU
+    temperature, pwm2 now follows the dGPU: the editor gains an "Editing:
+    CPU fan / GPU fan" selector with one curve per fan, and knob mode writes
+    one `# Knobs pwmN:` line per fan with per-fan executable FCTEMPS sources
+    (new /usr/bin/juno-gpu-curve next to juno-fan-curve; the plain millidegrees
+    source /usr/bin/juno-gpu-temp covers native configs).
+  * A runtime-suspended dGPU is treated as 25 C rather than queried: reading it
+    would wake the card, and the fan belongs at the floor of its curve then.
+    An awake card whose nvidia-smi fails falls back to coretemp — a
+    permanently failing FCTEMPS source would abort fancontrol into restorefans
+    every INTERVAL, which is strictly worse than following the neighbouring
+    heat source.
+  * fan-profile regen carries and caps both knob lines, and refuses to touch a
+    dual config whose GPU helper vanished. The root helper refuses knob mode
+    without --gpu-knobs on a dGPU machine, where the CPU curve would otherwise
+    drive pwm2 off the wrong temperature. Legacy single-line `# Knobs:` configs
+    read back as the CPU fan's curve and are normalized on the next regen.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Tue, 01 Sep 2026 08:40:00 -0400
+
 juno-kde-fancontrol (0.3.0+diamon1) unstable; urgency=low
 
   * Multi-point fan curves ("knobs"): click the plot in the editor to add a

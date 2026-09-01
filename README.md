@@ -23,6 +23,9 @@ editor is a standalone app).
   (up to 16 knobs), each knob draggable, right-click to remove one. The handle
   under the pointer grows and carries its own `78 °C → 47%` readout, since the
   axes cannot be read to a degree mid-drag. See [Knob curves](#knob-curves).
+- On a machine with a discrete GPU an `Editing:` selector above the chart gives
+  the GPU fan (pwm2) its own curve, driven by the dGPU temperature rather than
+  the CPU package. See [The GPU fan](#the-gpu-fan).
 - Reachable from **System Settings → System → Fan Control** as well as from the
   launcher. See [System Settings integration](#system-settings-integration).
 - Every colour comes from the active KDE colour scheme, so a Breeze/Breeze Dark
@@ -60,7 +63,7 @@ a `!`-prefixed executable in place of a hwmon path and uses the command's stdout
 as the reading, so knob mode writes
 
 ```
-# Knobs: 45:0 60:55 75:110 95:130
+# Knobs pwm1: 45:0 60:55 75:110 95:130
 FCTEMPS=hwmon7/pwm1=!/usr/bin/juno-fan-curve ...
 MINTEMP=hwmon7/pwm1=0
 MAXTEMP=hwmon7/pwm1=255
@@ -92,13 +95,39 @@ Three consequences worth knowing:
   `0,0,0,66,84,102,120` and knob `50,50,50,67,85,102,120`, both settling in four
   intervals — so knob mode neither adds nor removes it.
 - **The MIN/MAX keys stop being a curve.** `fan-profile status` prints the knobs
-  instead, `regen` carries the `# Knobs:` line through untouched, and the
+  instead, `regen` carries the `# Knobs` line(s) through untouched, and the
   calibrated noise cap is applied to the knobs (`cap_knobs`) rather than to
   `MAXPWM`, where it would rescale every commanded value by `cap/255`.
 
 Knob curves always honor the calibrated cap: `--knobs` and `--ignore-cap` are
 mutually exclusive in the root helper, since `regen` re-applies the cap at every
 boot and an exemption would last only until the next reboot.
+
+## The GPU fan
+
+pwm1 cools the CPU, pwm2 the GPU/chassis on this board family. With a dGPU the
+two fans stop sharing the CPU temperature:
+
+- **pwm2 follows the dGPU temperature, never the CPU's.** In every mode its
+  `FCTEMPS` entry is an executable source: `juno-gpu-temp` (plain millidegrees)
+  in native configs, `juno-gpu-curve` (the pwm2 knob curve as a virtual
+  temperature) in knob mode. The config carries one `# Knobs pwmN:` line per
+  fan; the knob-helper arguments and the regen/cap machinery all split per fan.
+- **A runtime-suspended card is cold, not queried.** Reading a suspended GPU
+  resumes it (~10 W), so the sources synthesize 25 °C from the power state
+  alone and the GPU fan sits at the floor of its curve. The never-wake order is
+  tested by logging every fake nvidia-smi call and requiring the log to stay
+  empty.
+- **A broken driver stack degrades, not panics.** An awake card whose
+  `nvidia-smi` fails falls back to `coretemp`, because a permanently failing
+  `FCTEMPS` source would abort `fancontrol` into `restorefans` every INTERVAL —
+  strictly worse than following the neighbouring heat source.
+- **The UI shows it only when it exists.** No dGPU means no selector and the
+  old single-curve window everywhere (GUI, `fan-profile`, the helper), so the
+  feature cannot drift into a phantom second fan.
+
+The CPU/GPU split is per-board wiring (`pwm1`/`pwm2`); the EC's own labels are
+the generic `Fan 1`/`Fan 2` and carry the mapping nowhere.
 
 ## System Settings integration
 
@@ -229,6 +258,8 @@ fixture tree with no hardware at all.
 | `/usr/bin/juno-kde-fancontrol` | the curve editor |
 | `/usr/bin/juno-fan-monitor` | the tray monitor |
 | `/usr/bin/juno-fan-curve` | `FCTEMPS` source that evaluates a knob curve, see [Knob curves](#knob-curves) |
+| `/usr/bin/juno-gpu-curve` | the same for the GPU fan (pwm2) off the dGPU temperature |
+| `/usr/bin/juno-gpu-temp` | plain dGPU millidegrees source for native configs |
 | `/usr/sbin/juno-fancontrol-apply` | root helper behind pkexec |
 | `…/fancontrol.service.d/30-juno-fancontrol.conf` | `Restart=always` + the boot-time `fan-profile regen` |
 | `/usr/lib/systemd/system-sleep/fancontrol-resume` | re-attach the curve after resume |

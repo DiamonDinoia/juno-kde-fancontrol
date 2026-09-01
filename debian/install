@@ -1,6 +1,7 @@
 app.py usr/lib/juno-kde-fancontrol/
 tray.py usr/lib/juno-kde-fancontrol/
 fancurve.py usr/lib/juno-kde-fancontrol/
+gputemp.py usr/lib/juno-kde-fancontrol/
 backend usr/lib/juno-kde-fancontrol/
 juno-fancontrol-apply usr/sbin/
 fan-profile usr/bin/
@@ -8,6 +9,8 @@ fan-calibrate usr/bin/
 scripts/juno-kde-fancontrol usr/bin/
 scripts/juno-fan-monitor usr/bin/
 scripts/juno-fan-curve usr/bin/
+scripts/juno-gpu-curve usr/bin/
+scripts/juno-gpu-temp usr/bin/
 juno-kde-fancontrol.desktop usr/share/applications/
 juno-fan-monitor.desktop usr/share/applications/
 juno-fancontrol-settings.desktop usr/share/plasma/systemsettings/externalmodules/

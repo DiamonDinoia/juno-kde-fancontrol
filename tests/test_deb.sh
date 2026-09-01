@@ -33,12 +33,15 @@ contents=$(dpkg-deb -c "$DEB")
 for f in /usr/lib/juno-kde-fancontrol/app.py \
          /usr/lib/juno-kde-fancontrol/tray.py \
          /usr/lib/juno-kde-fancontrol/fancurve.py \
+         /usr/lib/juno-kde-fancontrol/gputemp.py \
          /usr/lib/juno-kde-fancontrol/backend/fancore.py \
          /usr/lib/juno-kde-fancontrol/backend/sysmon.py \
          /usr/sbin/juno-fancontrol-apply \
          /usr/bin/juno-kde-fancontrol \
          /usr/bin/juno-fan-monitor \
          /usr/bin/juno-fan-curve \
+         /usr/bin/juno-gpu-curve \
+         /usr/bin/juno-gpu-temp \
          /usr/share/applications/juno-kde-fancontrol.desktop \
          /usr/share/applications/juno-fan-monitor.desktop \
          /usr/share/plasma/systemsettings/externalmodules/juno-fancontrol-settings.desktop \
@@ -122,7 +125,7 @@ appicon=$(sed -n 's/^APP_ICON = "\(.*\)"/\1/p' /usr/lib/juno-kde-fancontrol/app.
     || bad settings-icon-matches-window "entry icons=$icons app.py=$appicon"
 # the wrappers run these through python3, so an executable bit here is a
 # lintian error and a sign install.sh and debian/install have drifted apart
-pymodes=$(stat -c '%n %a' /usr/lib/juno-kde-fancontrol/{app,tray,fancurve}.py /usr/lib/juno-kde-fancontrol/backend/*.py)
+pymodes=$(stat -c '%n %a' /usr/lib/juno-kde-fancontrol/{app,tray,fancurve,gputemp}.py /usr/lib/juno-kde-fancontrol/backend/*.py)
 if grep -qv ' 644$' <<< "$pymodes"; then
     bad py-modules-not-executable "$pymodes"
 else
@@ -173,6 +176,41 @@ got=$(/usr/bin/juno-fan-curve --config "$KNOBWORK/fancontrol" --sysfs "$KNOBWORK
 # 67 C on the (60,55)..(75,110) segment: (67-60)*55//15 + 55 = 80 -> 80000 mC
 [[ "$got" == "80000" ]] \
     && ok fan-curve-evaluates-installed || bad fan-curve-evaluates-installed "got '$got'"
+# the GPU fan's pair: a dual config, an awake dGPU fixture, a fake nvidia-smi
+"$PYTHON" - "$KNOBWORK" "$SRC/tests" <<'PYEOF'
+import sys
+sys.path.insert(0, "/usr/lib/juno-kde-fancontrol")
+sys.path.insert(0, sys.argv[2])
+from pathlib import Path
+from mktree import make_dgpu, write_fake_nvidia_smi
+from backend.fancore import Curve, discover, parse_knobs, render_config
+work = Path(sys.argv[1])
+ct = work / "fancontrol"
+cpu = parse_knobs(ct.read_text())
+make_dgpu(work / "pci", awake=True)
+write_fake_nvidia_smi(work / "smi", work / "smi.log", temp_c=67)
+(work / "gpu.fancontrol").write_text(render_config(
+    Curve(label="custom", minstart=70, knobs=cpu), discover(str(work / "sys")),
+    "2026-08-31 07:35", fan_curve="/usr/bin/juno-fan-curve", dgpu=True,
+    gpu_curve=Curve(label="custom", minstart=70, knobs=((40, 0), (60, 80), (85, 255))),
+    gpu_helper="/usr/bin/juno-gpu-curve"))
+PYEOF
+got=$(/usr/bin/juno-gpu-curve --config "$KNOBWORK/gpu.fancontrol" --sysfs "$KNOBWORK/sys" \
+        --pci "$KNOBWORK/pci" --smi "$KNOBWORK/smi" 2>&1)
+# 67 C on the (60,80)..(85,255) segment: (67-60)*175//25 + 80 = 129 -> 129000 mC
+[[ "$got" == "129000" ]] \
+    && ok gpu-curve-evaluates-installed || bad gpu-curve-evaluates-installed "got '$got'"
+got=$(/usr/bin/juno-gpu-temp --pci "$KNOBWORK/pci" --smi "$KNOBWORK/smi" --sysfs "$KNOBWORK/sys" 2>&1)
+[[ "$got" == "67000" ]] \
+    && ok gpu-temp-evaluates-installed || bad gpu-temp-evaluates-installed "got '$got'"
+# a suspended card answers cold and never wakes. The awake checks above are
+# legitimate smi calls, so the never-wake assertion is measured from here.
+: > "$KNOBWORK/smi.log"
+echo suspended > "$KNOBWORK/pci/power/runtime_status"
+echo D3cold > "$KNOBWORK/pci/power_state"
+got=$(/usr/bin/juno-gpu-temp --pci "$KNOBWORK/pci" --smi "$KNOBWORK/smi" --sysfs "$KNOBWORK/sys" 2>&1)
+[[ "$got" == "25000" && ! -s "$KNOBWORK/smi.log" ]] \
+    && ok gpu-temp-suspended-installed || bad gpu-temp-suspended-installed "got '$got'"
 # fancontrol itself must accept the config that names it as a `!` source
 if command -v fancontrol >/dev/null || [[ -x /usr/sbin/fancontrol ]]; then
     /usr/sbin/fancontrol --check "$KNOBWORK/fancontrol" >/dev/null 2>&1 \

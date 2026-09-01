@@ -35,6 +35,7 @@ install -d "$LIB/backend"
 install -m644 "$SELF/app.py"  "$LIB/app.py"
 install -m644 "$SELF/tray.py" "$LIB/tray.py"
 install -m644 "$SELF/fancurve.py" "$LIB/fancurve.py"
+install -m644 "$SELF/gputemp.py" "$LIB/gputemp.py"
 install -m644 "$SELF/backend/__init__.py" "$LIB/backend/__init__.py"
 install -m644 "$SELF/backend/fancore.py"  "$LIB/backend/fancore.py"
 install -m644 "$SELF/backend/sysmon.py"   "$LIB/backend/sysmon.py"
@@ -49,7 +50,7 @@ install -D -m644 "$SELF/juno-fan-monitor.desktop"    /usr/share/applications/jun
 install -D -m644 "$SELF/juno-fancontrol-settings.desktop" \
     /usr/share/plasma/systemsettings/externalmodules/juno-fancontrol-settings.desktop
 # entry points: the scripts hardcode /usr/lib; rewrite them for a /usr/local install
-for w in juno-kde-fancontrol juno-fan-monitor juno-fan-curve; do
+for w in juno-kde-fancontrol juno-fan-monitor juno-fan-curve juno-gpu-curve juno-gpu-temp; do
     sed "s|/usr/lib/juno-kde-fancontrol|$LIB|" "$SELF/scripts/$w" \
         | install -m755 /dev/stdin "/usr/local/bin/$w"
 done
