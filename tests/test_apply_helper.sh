@@ -31,6 +31,20 @@ make_tree() { # make_tree N_FANS
     done
 }
 
+# --- fixture: a dGPU. Default is NO card — the writers' default PCI paths point
+# at the real /sys, and this laptop has one, which would leak the GPU branches
+# into every dGPU-unaware expectation. Tests that need a card set DGPU_DIR and
+# regenerate the wrappers. ---
+DGPU_DIR="$ROOT/no-dgpu"
+make_dgpu() { # make_dgpu  -> repoints DGPU_DIR at a live (awake, 55 C) fixture
+    DGPU_DIR="$ROOT/dgpu"
+    mkdir -p "$DGPU_DIR/power"
+    echo active > "$DGPU_DIR/power/runtime_status"
+    echo D0 > "$DGPU_DIR/power_state"
+    export JFC_DGPU_PCI="$DGPU_DIR"
+    real_fpwrap
+}
+
 # --- fixture: fake tools + service state -------------------------------------
 mkdir -p "$ROOT/bin" "$ROOT/etc" "$ROOT/state"
 cat > "$ROOT/bin/systemctl" <<EOF
@@ -75,7 +89,9 @@ real_fpwrap() {
     cat > "$ROOT/bin/fpwrap" <<EOF
 #!/bin/bash
 exec env FP_AS_ROOT=1 FP_SYSFS="$ROOT/sys" FP_FANCONFIG="$ROOT/etc/fancontrol" \
-         FP_CAP_FILE="$ROOT/etc/fan-profile.maxpwm" "$FP_LIVE" "\$@"
+         FP_CAP_FILE="$ROOT/etc/fan-profile.maxpwm" FP_DGPU_PCI="$DGPU_DIR" \
+         FP_GPU_TEMP="$ROOT/bin/juno-gpu-temp" FP_GPU_CURVE="$ROOT/bin/juno-gpu-curve" \
+         "$FP_LIVE" "\$@"
 EOF
     chmod +x "$ROOT/bin/fpwrap"
 }
@@ -84,12 +100,15 @@ real_fpwrap
 export JFC_PLATFORM_DIR="$ROOT/sys" JFC_FANCONFIG="$ROOT/etc/fancontrol" \
        JFC_CAP_FILE="$ROOT/etc/fan-profile.maxpwm" JFC_SYSTEMCTL="$ROOT/bin/systemctl" \
        JFC_FANCONTROL="$ROOT/bin/fancontrol" JFC_FAN_PROFILE="$ROOT/bin/fan-profile" \
-       JFC_NOW="2026-08-31 07:35"
+       JFC_NOW="2026-08-31 07:35" JFC_DGPU_PCI="$DGPU_DIR"
 # Knob mode needs an executable FCTEMPS source. The real one is python; a stub
 # is enough here because nothing in this suite evaluates the curve.
 printf '#!/bin/sh\necho 74000\n' > "$ROOT/bin/juno-fan-curve"
-chmod +x "$ROOT/bin/juno-fan-curve"
-export JFC_FAN_CURVE="$ROOT/bin/juno-fan-curve"
+printf '#!/bin/sh\necho 55000\n' > "$ROOT/bin/juno-gpu-curve"
+printf '#!/bin/sh\necho 55000\n' > "$ROOT/bin/juno-gpu-temp"
+chmod +x "$ROOT/bin/"{juno-fan-curve,juno-gpu-curve,juno-gpu-temp}
+export JFC_FAN_CURVE="$ROOT/bin/juno-fan-curve" JFC_GPU_CURVE="$ROOT/bin/juno-gpu-curve" \
+       JFC_GPU_TEMP="$ROOT/bin/juno-gpu-temp"
 APPLY="${APPLY:-$SRC/juno-fancontrol-apply}"   # APPLY env: test the packaged helper
 
 reset_state() {
@@ -258,7 +277,7 @@ out=$(NO_RESTART=1 "$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
 diff <(render_knob_ref "$KN") "$ROOT/etc/fancontrol" >/dev/null \
     && ok T13-knob-byte-exact \
     || bad T13-knob-byte-exact "$(diff <(render_knob_ref "$KN") "$ROOT/etc/fancontrol" | head -6)"
-grep -qx "# Knobs: $KN" "$ROOT/etc/fancontrol" \
+grep -qx "# Knobs pwm1: $KN" "$ROOT/etc/fancontrol" \
     && ok T13-knob-line || bad T13-knob-line "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
 grep -q "^FCTEMPS=hwmon7/pwm1=!$JFC_FAN_CURVE " "$ROOT/etc/fancontrol" \
     && ok T13-knob-fctemps || bad T13-knob-fctemps "$(grep '^FCTEMPS=' "$ROOT/etc/fancontrol")"
@@ -287,7 +306,7 @@ out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
 mv "$ROOT/sys/clevofan/hwmon/hwmon7" "$ROOT/sys/clevofan/hwmon/hwmon4"
 out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok T14b-drift-regen-ok || bad T14b-drift-regen-ok "rc=$rc $out"
-grep -qx "# Knobs: $KN" "$ROOT/etc/fancontrol" \
+grep -qx "# Knobs pwm1: $KN" "$ROOT/etc/fancontrol" \
     && ok T14b-drift-keeps-knobs || bad T14b-drift-keeps-knobs "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
 grep -q "^FCTEMPS=hwmon4/pwm1=!$JFC_FAN_CURVE " "$ROOT/etc/fancontrol" \
     && ok T14b-drift-refreshes-index || bad T14b-drift-refreshes-index "$(grep '^FCTEMPS=' "$ROOT/etc/fancontrol")"
@@ -313,7 +332,7 @@ done
 make_tree 2; reset_state; real_fpwrap
 out=$("$APPLY" --knobs "45:0 60:100 95:255" "${XFER[@]}" 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok T16-cap-apply || bad T16-cap-apply "rc=$rc $out"
-grep -qx "# Knobs: 45:0 60:100 95:150" "$ROOT/etc/fancontrol" \
+grep -qx "# Knobs pwm1: 45:0 60:100 95:150" "$ROOT/etc/fancontrol" \
     && ok T16-cap-clamps-knobs || bad T16-cap-clamps-knobs "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
 grep -qx "MAXPWM=hwmon7/pwm1=255 hwmon7/pwm2=255" "$ROOT/etc/fancontrol" \
     && ok T16-cap-leaves-xfer || bad T16-cap-leaves-xfer "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
@@ -339,11 +358,11 @@ done
 # the curve was written, which is the order fan-calibrate --apply actually uses.
 make_tree 2; reset_state; real_fpwrap
 NO_RESTART=1 "$APPLY" --knobs "45:0 60:100 95:255" "${XFER[@]}" >/dev/null 2>&1
-sed -i 's/^# Knobs:.*/# Knobs: 45:0 60:100 95:255/' "$ROOT/etc/fancontrol"
+sed -i 's/^# Knobs pwm1:.*/# Knobs pwm1: 45:0 60:100 95:255/' "$ROOT/etc/fancontrol"
 echo 90 > "$ROOT/etc/fan-profile.maxpwm"
 out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok T17b-recap-regen || bad T17b-recap-regen "rc=$rc $out"
-grep -qx "# Knobs: 45:0 60:90 95:90" "$ROOT/etc/fancontrol" \
+grep -qx "# Knobs pwm1: 45:0 60:90 95:90" "$ROOT/etc/fancontrol" \
     && ok T17b-recap-clamps || bad T17b-recap-clamps "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
 echo 150 > "$ROOT/etc/fan-profile.maxpwm"
 
@@ -375,7 +394,7 @@ make_tree 1; reset_state; real_fpwrap
 out=$("$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok T19-one-fan-knobs || bad T19-one-fan-knobs "rc=$rc $out"
 grep -q pwm2 "$ROOT/etc/fancontrol" && bad T19-one-fan-no-pwm2 "pwm2 resurrected" || ok T19-one-fan-no-pwm2
-grep -qx "# Knobs: $KN" "$ROOT/etc/fancontrol" \
+grep -qx "# Knobs pwm1: $KN" "$ROOT/etc/fancontrol" \
     && ok T19-one-fan-knob-line || bad T19-one-fan-knob-line "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
 
 # T20: DEVNAME must come from sysfs in BOTH shell writers, not from this
@@ -398,6 +417,144 @@ out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
 grep -qx "DEVNAME=hwmon7=Clevo_Fan_X_Y hwmon10=core_temp_2" "$ROOT/etc/fancontrol" \
     && ok T20-regen-reads-devnames \
     || bad T20-regen-reads-devnames "$(grep '^DEVNAME' "$ROOT/etc/fancontrol")"
+
+# --- T21: the GPU fan ------------------------------------------------------------
+# The cap fixture is 150; a ref at 255 would be clamped by the apply itself, so
+# the dual-knob fixtures stay under it. Values above the cap are T21e's job.
+GKN="40:0 60:80 85:150"
+
+# reference text with a card: render_config(dgpu=True, gpu_curve=...)
+render_dual_ref() { # render_dual_ref "active knobs" as below
+    "$PY" - "$ROOT/sys" "$SRC" "$JFC_FAN_CURVE" "$JFC_GPU_CURVE" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[2])
+from backend.fancore import Curve, discover, render_config
+hw = discover(sys.argv[1])
+cpu = Curve(interval=10, minstart=70, average=4, label="custom",
+            knobs=((45, 0), (60, 55), (75, 110), (95, 130)))
+gpu = Curve(interval=10, minstart=70, average=4, label="custom",
+            knobs=((40, 0), (60, 80), (85, 150)))
+sys.stdout.write(render_config(cpu, hw, "2026-08-31 07:35", fan_curve=sys.argv[3],
+                               dgpu=True, gpu_curve=gpu, gpu_helper=sys.argv[4]))
+PYEOF
+}
+
+# T21a: native preset on a dGPU machine: pwm1 coretemp, pwm2 the gpu source,
+# byte-identical to render_config(dgpu=True).
+make_tree 2; make_dgpu; reset_state
+out=$(NO_RESTART=1 "$APPLY" 10 60 95 70 50 0 120 4 quiet 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T21a-native-apply || bad T21a-native-apply "rc=$rc $out"
+"$PY" - "$ROOT/sys" "$SRC" "$JFC_GPU_TEMP" > "$ROOT/ref-gpu.txt" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[2])
+from backend.fancore import Curve, discover, render_config
+c = Curve(interval=10, mintemp=60, maxtemp=95, minstart=70, minstop=50,
+          minpwm=0, maxpwm=120, average=4, label="quiet")
+sys.stdout.write(render_config(c, discover(sys.argv[1]), "2026-08-31 07:35",
+                               dgpu=True, gpu_temp=sys.argv[3]))
+PYEOF
+diff -q "$ROOT/ref-gpu.txt" "$ROOT/etc/fancontrol" >/dev/null \
+    && ok T21a-native-byte-exact \
+    || bad T21a-native-byte-exact "$(diff "$ROOT/ref-gpu.txt" "$ROOT/etc/fancontrol" | head -6)"
+
+# T21b: knob mode with a card but no --gpu-knobs is refused, before any write.
+make_tree 2; make_dgpu; reset_state
+"$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" >/dev/null 2>&1
+keep=$(md5sum < "$ROOT/etc/fancontrol")
+out=$("$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -ne 0 ]] && grep -q "gpu-knobs" <<<"$out" \
+    && ok T21b-half-split-refused || bad T21b-half-split-refused "rc=$rc $out"
+[[ "$keep" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T21b-config-untouched || bad T21b-config-untouched "rewritten by a refused apply"
+
+# T21c: dual knob apply, byte-identical to render_config(dgpu=True, gpu_curve).
+make_tree 2; make_dgpu; reset_state
+out=$(NO_RESTART=1 "$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T21c-dual-apply || bad T21c-dual-apply "rc=$rc $out"
+diff <(render_dual_ref) "$ROOT/etc/fancontrol" >/dev/null \
+    && ok T21c-dual-byte-exact \
+    || bad T21c-dual-byte-exact "$(diff <(render_dual_ref) "$ROOT/etc/fancontrol" | head -8)"
+grep -qx "# Knobs pwm1: $KN" "$ROOT/etc/fancontrol" && ok T21c-cpu-line \
+    || bad T21c-cpu-line "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+grep -qx "# Knobs pwm2: $GKN" "$ROOT/etc/fancontrol" && ok T21c-gpu-line \
+    || bad T21c-gpu-line "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+
+# T21d: boot contract with two curves: regen keeps both lines and refreshes BOTH
+# executable sources after an index drift, byte-identical each time.
+make_tree 2; make_dgpu; reset_state
+"$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" >/dev/null 2>&1
+grep -qx "MAXPWM=hwmon7/pwm1=255 hwmon7/pwm2=255" "$ROOT/etc/fancontrol" \
+    && ok T21d-xfer-survived-restart \
+    || bad T21d-xfer-survived-restart "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
+mv "$ROOT/sys/clevofan/hwmon/hwmon7" "$ROOT/sys/clevofan/hwmon/hwmon4"
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T21d-drift-regen || bad T21d-drift-regen "rc=$rc $out"
+grep -q "^FCTEMPS=hwmon4/pwm1=!$JFC_FAN_CURVE hwmon4/pwm2=!$JFC_GPU_CURVE\$" \
+    "$ROOT/etc/fancontrol" \
+    && ok T21d-drift-splits-sources \
+    || bad T21d-drift-splits-sources "$(grep '^FCTEMPS=' "$ROOT/etc/fancontrol")"
+grep -qx "# Knobs pwm2: $GKN" "$ROOT/etc/fancontrol" \
+    && ok T21d-drift-keeps-gpu-knobs \
+    || bad T21d-drift-keeps-gpu-knobs "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+
+# T21e: the cap lands on BOTH knob lines.
+make_tree 2; make_dgpu; reset_state
+"$APPLY" --knobs "45:0 60:100 95:200" --gpu-knobs "40:0 95:255" \
+    "${XFER[@]}" >/dev/null 2>&1
+grep -qx "# Knobs pwm1: 45:0 60:100 95:150" "$ROOT/etc/fancontrol" \
+    && ok T21e-cap-clamps-cpu \
+    || bad T21e-cap-clamps-cpu "$(grep '^# Knobs pwm1' "$ROOT/etc/fancontrol")"
+grep -qx "# Knobs pwm2: 40:0 95:150" "$ROOT/etc/fancontrol" \
+    && ok T21e-cap-clamps-gpu \
+    || bad T21e-cap-clamps-gpu "$(grep '^# Knobs pwm2' "$ROOT/etc/fancontrol")"
+
+# T21f: --gpu-knobs without a card is refused (wrong machine, not silently kept).
+DGPU_DIR="$ROOT/no-dgpu"; export JFC_DGPU_PCI="$DGPU_DIR"
+make_tree 2; reset_state; real_fpwrap
+"$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" >/dev/null 2>&1
+keep=$(md5sum < "$ROOT/etc/fancontrol")
+out=$(NO_RESTART=1 "$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -ne 0 ]] && grep -q "no dGPU" <<<"$out" \
+    && ok T21f-gpu-knobs-no-card || bad T21f-gpu-knobs-no-card "rc=$rc $out"
+[[ "$keep" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T21f-config-untouched || bad T21f-config-untouched "rewritten by a refused apply"
+
+# T21g: a dual config whose gpu helper vanished before reboot: regen leaves the
+# file alone so fancontrol aborts into the EC curve.
+make_tree 2; make_dgpu; reset_state
+"$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" >/dev/null 2>&1
+sed -i "s|!$JFC_GPU_CURVE|!$ROOT/bin/absent-gpu-curve|g" "$ROOT/etc/fancontrol"
+keep=$(md5sum < "$ROOT/etc/fancontrol")
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T21g-regen-survives || bad T21g-regen-survives "rc=$rc $out"
+[[ "$keep" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T21g-regen-untouched || bad T21g-regen-untouched "regen rewrote a config it cannot evaluate"
+grep -q "knob helper" <<< "$out" && ok T21g-regen-names-helper \
+    || bad T21g-regen-names-helper "$out"
+
+# T21h: a dGPU machine running a native preset keeps pwm2 on the gpu source
+# after a reboot replay (fpwrap regen writes fan_header itself).
+make_tree 2; make_dgpu; reset_state
+"$APPLY" 10 60 95 70 50 0 120 4 quiet >/dev/null 2>&1
+grep -q "pwm2=!$JFC_GPU_TEMP" "$ROOT/etc/fancontrol" \
+    && ok T21h-restart-keeps-gpu-source \
+    || bad T21h-restart-keeps-gpu-source "$(grep '^FCTEMPS=' "$ROOT/etc/fancontrol")"
+
+# T21i: fan-calibrate lowers the cap after a dual curve is written, so regen
+# re-caps BOTH knob lines — the boot path, distinct from T21e's apply-time
+# clamp. Skipping the gpu line here is exactly what M31 measures.
+make_tree 2; make_dgpu; reset_state
+NO_RESTART=1 "$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" >/dev/null 2>&1
+sed -i 's/^# Knobs pwm1:.*/# Knobs pwm1: 45:0 60:100 95:200/
+        s/^# Knobs pwm2:.*/# Knobs pwm2: 40:0 95:255/' "$ROOT/etc/fancontrol"
+echo 90 > "$ROOT/etc/fan-profile.maxpwm"
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T21i-recap-regen || bad T21i-recap-regen "rc=$rc $out"
+grep -qx "# Knobs pwm1: 45:0 60:90 95:90" "$ROOT/etc/fancontrol" \
+    && ok T21i-recap-cpu || bad T21i-recap-cpu "$(grep '^# Knobs pwm1' "$ROOT/etc/fancontrol")"
+grep -qx "# Knobs pwm2: 40:0 95:90" "$ROOT/etc/fancontrol" \
+    && ok T21i-recap-gpu || bad T21i-recap-gpu "$(grep '^# Knobs pwm2' "$ROOT/etc/fancontrol")"
+echo 150 > "$ROOT/etc/fan-profile.maxpwm"
 
 echo
 echo "helper tests: $PASS passed, $FAIL failed"

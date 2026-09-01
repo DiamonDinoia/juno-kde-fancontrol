@@ -37,3 +37,27 @@ def write_fake_systemctl(path: Path, log: Path, *, active: bool = True) -> Path:
     path.write_text(script)
     path.chmod(0o755)
     return path
+
+
+def make_dgpu(root, *, awake: bool = True, temp_c: int = 55) -> Path:
+    """A fake dGPU PCI device. Awake cards also need a fake nvidia-smi (see
+    write_fake_nvidia_smi); suspended ones must never see it called — the fan
+    sources read the power state first precisely so they never wake the card."""
+    root = Path(root)
+    (root / "power").mkdir(parents=True, exist_ok=True)
+    (root / "power/runtime_status").write_text("active\n" if awake else "suspended\n")
+    (root / "power_state").write_text("D0\n" if awake else "D3cold\n")
+    return root
+
+
+def write_fake_nvidia_smi(path: Path, log: Path, *, temp_c: int = 55,
+                          fail: bool = False) -> Path:
+    # The log proves the never-wake rule: a suspended-GPU run must leave it empty.
+    script = (
+        "#!/bin/bash\n"
+        f'echo "$*" >> "{log}"\n'
+        + ("exit 1\n" if fail else
+           f'echo "{temp_c}, 0, 0.0, 0"\n'))  # temp,util,power,mem — csv,noheader
+    path.write_text(script)
+    path.chmod(0o755)
+    return path

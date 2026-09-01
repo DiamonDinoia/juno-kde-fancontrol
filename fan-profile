@@ -49,13 +49,36 @@ for _p in "$SYSFS/clevofan/hwmon/$FANHW"/pwm[0-9]; do
 done
 ((${#PWMS[@]})) || PWMS=(pwm1 pwm2)
 
+# The GPU fan's dGPU sources, same two-location search as the knob helper.
+# pwm1 cools the CPU, pwm2 the GPU/chassis: on a machine with a card, pwm2
+# follows the dGPU temperature (plain millidegrees in native mode, the pwm2
+# knob curve in knob mode); without a card everything stays on coretemp.
+GPU_TEMP="${FP_GPU_TEMP:-}"
+for _gt in /usr/bin/juno-gpu-temp /usr/local/bin/juno-gpu-temp; do
+    [[ -n "$GPU_TEMP" ]] && break
+    [[ -x "$_gt" ]] && GPU_TEMP=$_gt && break
+done
+GPU_TEMP=${GPU_TEMP:-/usr/bin/juno-gpu-temp}
+GPU_CURVE="${FP_GPU_CURVE:-}"
+for _gc in /usr/bin/juno-gpu-curve /usr/local/bin/juno-gpu-curve; do
+    [[ -n "$GPU_CURVE" ]] && break
+    [[ -x "$_gc" ]] && GPU_CURVE=$_gc && break
+done
+GPU_CURVE=${GPU_CURVE:-/usr/bin/juno-gpu-curve}
+DGPU_PCI="${FP_DGPU_PCI:-/sys/bus/pci/devices/0000:01:00.0}"
+[[ -d "$DGPU_PCI" ]] && HAVE_DGPU=1 || HAVE_DGPU=0
+
 # Knob-mode configs (written by juno-kde-fancontrol) drive fancontrol through
 # an executable FCTEMPS source rather than a hwmon temp input, because
-# fancontrol interpolates only one linear segment. The curve itself lives in the
-# `# Knobs:` comment and the MIN/MAX keys hold a fixed transfer calibration.
-# regen carries both through untouched and refreshes only the fan hwmon index.
-KNOB_HELPER=""   # non-empty selects the knob-mode header, set by regen_custom
-KNOB_LINE=""
+# fancontrol interpolates only one linear segment. The curves live in one
+# `# Knobs pwmN:` comment per fan and the MIN/MAX keys hold a fixed transfer
+# calibration. regen carries both lines through untouched and refreshes only
+# the fan hwmon index. A legacy config's untagged `# Knobs:` line drove both
+# fans off the CPU temperature, so it reads back as pwm1's.
+KNOB_HELPER=""       # pwm1's executable FCTEMPS source, read back by regen
+KNOB_GPU_HELPER=""   # pwm2's, when the config carries one
+KNOB_CPU=""          # the normalized "# Knobs pwm1: ..." line, or empty
+KNOB_GPU=""          # the "# Knobs pwm2: ..." line, or empty
 
 # per_pwm KEY VALUE -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=VALUE ..."
 per_pwm() {
@@ -87,8 +110,14 @@ EOF
 fan_header() {
     local temps=() fans=() p
     for p in "${PWMS[@]}"; do
-        if [[ -n "$KNOB_HELPER" ]]; then
-            temps+=("$FANHW/$p=!$KNOB_HELPER")
+        if [[ -n "$KNOB_CPU" ]]; then
+            if [[ "$p" == "pwm2" && "$HAVE_DGPU" == 1 && -n "$KNOB_GPU" ]]; then
+                temps+=("$FANHW/$p=!$KNOB_GPU_HELPER")
+            else
+                temps+=("$FANHW/$p=!$KNOB_HELPER")
+            fi
+        elif [[ "$p" == "pwm2" && "$HAVE_DGPU" == 1 ]]; then
+            temps+=("$FANHW/$p=!$GPU_TEMP")
         else
             temps+=("$FANHW/$p=$TEMPHW/temp1_input")
         fi
@@ -106,8 +135,9 @@ write_curve() {
         echo "# Managed by fan-profile ($PROFILE) — $(date '+%Y-%m-%d %H:%M')"
         # Must stay byte-identical to fancore.render_config, which writes the
         # same file from the GUI. tests/test_fancore.py compares the two.
-        if [[ -n "$KNOB_LINE" ]]; then
-            echo "$KNOB_LINE"
+        if [[ -n "$KNOB_CPU" ]]; then
+            echo "$KNOB_CPU"
+            [[ -z "$KNOB_GPU" ]] || echo "$KNOB_GPU"
             echo "# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX"
             echo "# values below are the fixed transfer calibration, not the curve."
         else
@@ -132,7 +162,7 @@ apply_fancontrol() {
     # In knob mode MAXPWM is the transfer calibration, not a fan speed.
     # Clamping it would rescale every commanded pwm by cap/255 — the cap
     # belongs on the knobs, which cap_knobs handles before this runs.
-    [[ -n "$KNOB_LINE" ]] && clamp=0
+    [[ -n "$KNOB_CPU" ]] && clamp=0
     if [[ "$clamp" == "1" && -f "$CAP_FILE" ]]; then
         local cap; cap=$(tr -dc '0-9' < "$CAP_FILE")
         if [[ -n "$cap" ]] && (( maxpwm > cap )); then
@@ -172,8 +202,10 @@ show_status() {
         echo "active curve : $(grep -m1 '^# Managed by fan-profile' "$FANCONFIG" | sed 's/^# Managed by fan-profile (//; s/).*//')"
         # In knob mode the MIN/MAX keys are the transfer calibration, not the
         # curve, so print the knobs instead of misreporting 0..255 as a ramp.
-        if grep -q '^# Knobs:' "$FANCONFIG"; then
-            echo "  knobs (C:pwm) :$(sed -n 's/^# Knobs://p' "$FANCONFIG")"
+        if grep -q '^# Knobs' "$FANCONFIG"; then
+            sed -n -e 's/^# Knobs pwm1:/  knobs pwm1 (cpu):/p' \
+                   -e 's/^# Knobs pwm2:/  knobs pwm2 (gpu):/p' \
+                   -e 's/^# Knobs:/  knobs (cpu):/p' "$FANCONFIG"
             grep -E '^INTERVAL=' "$FANCONFIG" | sed 's/^/  /'
         else
             grep -E '^(INTERVAL|MINTEMP|MAXTEMP|MINPWM|MAXPWM)=' "$FANCONFIG" | sed 's/^/  /'
@@ -193,38 +225,47 @@ if [[ "$(id -u)" -ne 0 && "${FP_AS_ROOT:-0}" != "1" ]]; then exec sudo "$0" "$@"
 # regen_value CFG KEY -> first pwm1 value of a fancontrol key line
 regen_value() { sed -n "s/^$2=\\S*=\\([0-9]\\+\\).*/\\1/p" "$1" | head -1; }
 
-# Apply the calibrated noise ceiling to KNOB_LINE. fan-calibrate --apply writes
-# a new cap and then re-applies the current profile, which for a knob curve
-# lands in regen_custom — so this is where a freshly lowered cap takes effect.
-cap_knobs() {
-    local cap out=() kv t pwm
-    [[ -f "$CAP_FILE" ]] || return 0
-    cap=$(tr -dc '0-9' < "$CAP_FILE")
-    [[ -n "$cap" ]] || return 0
-    for kv in ${KNOB_LINE#'# Knobs:'}; do
+# Apply the calibrated noise ceiling to a knob line. fan-calibrate --apply
+# writes a new cap and then re-applies the current profile, which for a knob
+# curve lands in regen_custom — so this is where a lowered cap takes effect.
+cap_line() {  # cap_line "# Knobs pwm2: 40:0 95:255" CAP -> capped line on stdout
+    local out=() kv t pwm
+    for kv in ${1#*: }; do    # strip the '# Knobs pwmN:' prefix: up to the first ': '
         t=${kv%%:*}; pwm=${kv##*:}
-        (( pwm > cap )) && pwm=$cap
+        (( pwm > $2 )) && pwm=$2
         out+=("$t:$pwm")
     done
-    KNOB_LINE="# Knobs: ${out[*]}"
+    echo "${1%%:*}: ${out[*]}"
+}
+
+cap_knobs() {
+    [[ -f "$CAP_FILE" ]] || return 0
+    local cap; cap=$(tr -dc '0-9' < "$CAP_FILE")
+    [[ -n "$cap" ]] || return 0
+    [[ -z "$KNOB_CPU" ]] || KNOB_CPU=$(cap_line "$KNOB_CPU" "$cap")
+    [[ -z "$KNOB_GPU" ]] || KNOB_GPU=$(cap_line "$KNOB_GPU" "$cap")
 }
 
 # regen for a custom label (written by juno-kde-fancontrol): re-emit the
 # on-disk curve values with freshly-resolved hwmon indices, keeping the label.
 regen_custom() {
     local interval mintemp maxtemp minstart minstop minpwm maxpwm average v
-    KNOB_LINE=$(grep -m1 '^# Knobs:' "$FANCONFIG") || KNOB_LINE=""
-    if [[ -n "$KNOB_LINE" ]]; then
-        KNOB_HELPER=$(sed -n 's|^FCTEMPS=[^ ]*=!\([^ ]*\).*|\1|p' "$FANCONFIG" | head -1)
-        if [[ ! -x "$KNOB_HELPER" ]]; then
+    # A legacy untagged '# Knobs:' line drove both fans off the CPU temperature;
+    # normalize it to the pwm1 tag here so the rewrite is the canonical form.
+    KNOB_CPU=$(sed -n 's/^# Knobs \(pwm1: \)\?/# Knobs pwm1: /p' "$FANCONFIG" | head -1)
+    KNOB_GPU=$(grep -m1 '^# Knobs pwm2:' "$FANCONFIG") || KNOB_GPU=""
+    if [[ -n "$KNOB_CPU" ]]; then
+        KNOB_HELPER=$(sed -n 's|^FCTEMPS=[^ ]*pwm1=!\([^ ]*\).*|\1|p' "$FANCONFIG" | head -1)
+        KNOB_GPU_HELPER=$(sed -n 's|^FCTEMPS=.*pwm2=!\([^ ]*\).*|\1|p' "$FANCONFIG" | head -1)
+        if [[ ! -x "$KNOB_HELPER" ]] || { [[ -n "$KNOB_GPU" ]] && [[ ! -x "$KNOB_GPU_HELPER" ]]; }; then
             # No helper means no way to evaluate the curve. Leaving the file
             # alone makes fancontrol abort on ValidateDevices, which hands the
             # fans back to the EC — the safe outcome, not a silent wrong curve.
-            echo "fan-profile regen: knob helper '${KNOB_HELPER:-none}' missing or not executable, $FANCONFIG left untouched" >&2
+            echo "fan-profile regen: knob helper missing or not executable (cpu='${KNOB_HELPER:-none}' gpu='${KNOB_GPU_HELPER:-none}'), $FANCONFIG left untouched" >&2
             exit 0
         fi
     fi
-    [[ -n "$KNOB_LINE" ]] && cap_knobs
+    [[ -n "$KNOB_CPU" ]] && cap_knobs
     interval=$(sed -n 's/^INTERVAL=\([0-9]\+\).*/\1/p' "$FANCONFIG" | head -1)
     average=$(regen_value "$FANCONFIG" AVERAGE)
     mintemp=$(regen_value "$FANCONFIG" MINTEMP)

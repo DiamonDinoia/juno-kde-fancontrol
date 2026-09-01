@@ -10,16 +10,20 @@
 #   juno-fancontrol-apply --auto                        # hand fans to the EC
 #   juno-fancontrol-apply [--ignore-cap] INTERVAL MINTEMP MAXTEMP MINSTART \
 #                         MINSTOP MINPWM MAXPWM AVERAGE LABEL
-#   juno-fancontrol-apply --knobs "T:P T:P ..." <the same 9 args>
+#   juno-fancontrol-apply --knobs "T:P T:P ..." [--gpu-knobs "T:P T:P ..."] <9 args>
 #
-# --knobs writes a multi-point curve. fancontrol interpolates only one linear
-# segment, so the knobs go in a `# Knobs:` comment, FCTEMPS points at the
-# executable juno-fan-curve source, and the 9 positionals carry the fixed
-# transfer calibration (fancore.KNOB_XFER) rather than a curve.
+# --knobs writes multi-point curves. fancontrol interpolates only one linear
+# segment, so the knobs go in one `# Knobs <pwm>:` comment per fan, FCTEMPS
+# points pwm1 at the executable juno-fan-curve source and pwm2 at
+# juno-gpu-curve, and the 9 positionals carry the fixed transfer calibration
+# (fancore.KNOB_XFER) rather than a curve. On a machine with a dGPU --gpu-knobs
+# is mandatory in knob mode: the CPU curve would otherwise drive pwm2 off the
+# CPU temperature. Outside knob mode the dGPU machine's pwm2 follows
+# juno-gpu-temp, the plain millidegrees source.
 #
 # Test hooks (pkexec scrubs the environment, so these never leak into
 # production use): JFC_PLATFORM_DIR JFC_FANCONFIG JFC_CAP_FILE JFC_SYSTEMCTL
-# JFC_FANCONTROL JFC_FAN_PROFILE JFC_NOW NO_RESTART
+# JFC_FANCONTROL JFC_FAN_PROFILE JFC_NOW JFC_DGPU_PCI NO_RESTART
 set -euo pipefail
 
 PLATFORM_DIR="${JFC_PLATFORM_DIR:-/sys/devices/platform}"
@@ -43,6 +47,22 @@ if [[ -z "$FAN_CURVE" ]]; then
     done
     FAN_CURVE=${FAN_CURVE:-/usr/bin/juno-fan-curve}
 fi
+GPU_CURVE="${JFC_GPU_CURVE:-}"
+if [[ -z "$GPU_CURVE" ]]; then
+    for _gc in /usr/bin/juno-gpu-curve /usr/local/bin/juno-gpu-curve; do
+        [[ -x "$_gc" ]] && GPU_CURVE=$_gc && break
+    done
+    GPU_CURVE=${GPU_CURVE:-/usr/bin/juno-gpu-curve}
+fi
+GPU_TEMP="${JFC_GPU_TEMP:-}"
+if [[ -z "$GPU_TEMP" ]]; then
+    for _gt in /usr/bin/juno-gpu-temp /usr/local/bin/juno-gpu-temp; do
+        [[ -x "$_gt" ]] && GPU_TEMP=$_gt && break
+    done
+    GPU_TEMP=${GPU_TEMP:-/usr/bin/juno-gpu-temp}
+fi
+# pwm1 cools the CPU, pwm2 the GPU/chassis (fancore.CPU_PWM/GPU_PWM).
+DGPU_PCI="${JFC_DGPU_PCI:-/sys/bus/pci/devices/0000:01:00.0}"
 NOW="${JFC_NOW:-$(date '+%Y-%m-%d %H:%M')}"
 MAX_KNOBS=16   # keep in step with fancore.MAX_KNOBS
 
@@ -50,16 +70,18 @@ die() { echo "juno-fancontrol-apply: $*" >&2; exit 1; }
 
 usage() {
     echo "usage: juno-fancontrol-apply --auto" >&2
-    echo "   or: juno-fancontrol-apply [--ignore-cap] [--knobs \"T:P T:P ...\"] INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM AVERAGE LABEL" >&2
+    echo "   or: juno-fancontrol-apply [--ignore-cap] [--knobs \"T:P T:P ...\"] [--gpu-knobs \"T:P T:P ...\"] INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM AVERAGE LABEL" >&2
     exit 64
 }
 
 IGNORE_CAP=0
 KNOBS=""
+GPU_KNOBS=""
 while true; do
     case "${1:-}" in
         --ignore-cap) IGNORE_CAP=1; shift ;;
         --knobs)      KNOBS="${2:-}"; shift 2 ;;
+        --gpu-knobs)  GPU_KNOBS="${2:-}"; shift 2 ;;
         *)            break ;;
     esac
 done
@@ -85,27 +107,53 @@ done
 (( AVERAGE >= 1 && AVERAGE <= 16 ))   || die "AVERAGE must be 1..16"
 [[ "$LABEL" =~ ^[a-z0-9-]+$ ]]        || die "bad label '$LABEL'"
 
-# --- validate the knob list (same rules as fancore.Curve._validate_knobs) ---
+# --- validate the knob list(s) (same rules as fancore.Curve._validate_knobs) ---
 # This runs as root on caller-supplied argv, so it re-checks everything the GUI
 # already checked rather than trusting it.
+# parse_knobs SPECS_OUT... <- validate_knobs "T:P T:P ..." <name> (namerefs)
 KNOB_T=(); KNOB_P=()
-if [[ -n "$KNOBS" ]]; then
-    for kv in $KNOBS; do   # unquoted on purpose: split, then validate each token
+GPU_T=(); GPU_P=()
+validate_knobs() {
+    local specs="$1" which="$2"; local -n _t="$3" _p="$4"
+    local kv n i
+    for kv in $specs; do   # unquoted on purpose: split, then validate each token
         [[ "$kv" =~ ^([0-9]+):([0-9]+)$ ]] || die "bad knob '$kv', want TEMP:PWM"
-        KNOB_T+=("${BASH_REMATCH[1]}"); KNOB_P+=("${BASH_REMATCH[2]}")
+        _t+=("${BASH_REMATCH[1]}"); _p+=("${BASH_REMATCH[2]}")
     done
-    n=${#KNOB_T[@]}
-    (( n >= 2 ))          || die "a knob curve needs at least 2 knobs, got $n"
-    (( n <= MAX_KNOBS ))  || die "at most $MAX_KNOBS knobs, got $n"
+    n=${#_t[@]}
+    (( n >= 2 ))          || die "a knob curve needs at least 2 knobs, got $n ($which)"
+    (( n <= MAX_KNOBS ))  || die "at most $MAX_KNOBS knobs, got $n ($which)"
     for ((i = 0; i < n; i++)); do
-        (( KNOB_T[i] <= 130 )) || die "knob temperature must be 0..130 C, got ${KNOB_T[i]}"
-        (( KNOB_P[i] <= 255 )) || die "knob pwm must be 0..255, got ${KNOB_P[i]}"
+        (( _t[i] <= 130 )) || die "knob temperature must be 0..130 C, got ${_t[i]} ($which)"
+        (( _p[i] <= 255 )) || die "knob pwm must be 0..255, got ${_p[i]} ($which)"
         (( i == 0 )) && continue
-        (( KNOB_T[i] > KNOB_T[i-1] ))  || die "knob temperatures must ascend, got ${KNOB_T[i-1]} then ${KNOB_T[i]}"
-        # A fan curve that falls with temperature cools less as the CPU heats.
-        (( KNOB_P[i] >= KNOB_P[i-1] )) || die "knob pwm must not fall, got ${KNOB_P[i-1]} then ${KNOB_P[i]}"
+        (( _t[i] > _t[i-1] ))  || die "knob temperatures must ascend, got ${_t[i-1]} then ${_t[i]} ($which)"
+        # A fan curve that falls with temperature cools less as the chip heats.
+        (( _p[i] >= _p[i-1] )) || die "knob pwm must not fall, got ${_p[i-1]} then ${_p[i]} ($which)"
     done
+}
+clamp_knobs() {  # clamp_knobs CAP (namerefs) — clamping preserves the non-falling order
+    local cap="$1" clamped=0; local -n _p="$2"
+    for ((i = 0; i < ${#_p[@]}; i++)); do
+        if (( _p[i] > cap )); then _p[i]=$cap; clamped=1; fi
+    done
+    (( clamped )) && echo "clamping knob pwm to <= $cap (calibrated noise cap)"
+    return 0
+}
+
+HAVE_DGPU=0
+[[ -d "$DGPU_PCI" ]] && HAVE_DGPU=1
+
+if [[ -n "$KNOBS" || -n "$GPU_KNOBS" ]]; then
+    [[ -n "$KNOBS" ]] || die "--gpu-knobs needs --knobs: knob mode is per-fan, list both"
+    [[ -n "$GPU_KNOBS" ]] || (( HAVE_DGPU == 0 )) \
+        || die "this machine has a dGPU: knob mode needs --gpu-knobs too, or pwm2 would follow the CPU temperature"
+    [[ -z "$GPU_KNOBS" ]] || (( HAVE_DGPU == 1 )) \
+        || die "--gpu-knobs given, but no dGPU at $DGPU_PCI"
+    validate_knobs "$KNOBS" "pwm1" KNOB_T KNOB_P
+    [[ -z "$GPU_KNOBS" ]] || validate_knobs "$GPU_KNOBS" "pwm2" GPU_T GPU_P
     [[ -x "$FAN_CURVE" ]] || die "knob curves need $FAN_CURVE, which is missing or not executable"
+    [[ -z "$GPU_KNOBS" || -x "$GPU_CURVE" ]] || die "knob curves need $GPU_CURVE, which is missing or not executable"
     # The cap-exempt profile is turbo, a native preset that `fan-profile regen`
     # replays from its own table. A knob curve is only ever a custom label, and
     # regen re-applies the cap to its knobs at every boot, so accepting
@@ -141,13 +189,9 @@ if [[ "$IGNORE_CAP" != 1 && -f "$CAP_FILE" ]]; then
     CAP=$(tr -dc '0-9' < "$CAP_FILE")
     if [[ -n "$CAP" && -n "$KNOBS" ]]; then
         # In knob mode MAXPWM is the transfer calibration, so the cap has to
-        # land on the knobs themselves. Clamping preserves the non-falling
-        # order the validation above enforced.
-        clamped=0
-        for ((i = 0; i < ${#KNOB_P[@]}; i++)); do
-            if (( KNOB_P[i] > CAP )); then KNOB_P[i]=$CAP; clamped=1; fi
-        done
-        if (( clamped )); then echo "clamping knob pwm to <= $CAP (calibrated noise cap)"; fi
+        # land on the knobs themselves.
+        clamp_knobs "$CAP" KNOB_P
+        [[ -z "$GPU_KNOBS" ]] || clamp_knobs "$CAP" GPU_P
     elif [[ -n "$CAP" ]] && (( MAXPWM > CAP )); then
         echo "clamping MAXPWM $MAXPWM -> $CAP (calibrated noise cap)"
         MAXPWM="$CAP"
@@ -166,7 +210,10 @@ pair() { # pair KEY VALUE -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=VALUE ..."
 
 FCTEMPS=(); FCFANS=()
 for pwm in "${PWMS[@]}"; do
-    if [[ -n "$KNOBS" ]]; then
+    if [[ "$pwm" == "pwm2" ]] && (( HAVE_DGPU )); then
+        if [[ -n "$KNOBS" ]]; then FCTEMPS+=("$FANHW/$pwm=!$GPU_CURVE")
+        else FCTEMPS+=("$FANHW/$pwm=!$GPU_TEMP"); fi
+    elif [[ -n "$KNOBS" ]]; then
         FCTEMPS+=("$FANHW/$pwm=!$FAN_CURVE")
     else
         FCTEMPS+=("$FANHW/$pwm=$TEMPHW/temp1_input")
@@ -174,20 +221,24 @@ for pwm in "${PWMS[@]}"; do
     FCFANS+=("$FANHW/$pwm=$FANHW/fan${pwm#pwm}_input")
 done
 
-KNOB_LINE=""
+KNOB_LINES=()
 if [[ -n "$KNOBS" ]]; then
-    KNOB_LINE="# Knobs:"
-    for ((i = 0; i < ${#KNOB_T[@]}; i++)); do
-        KNOB_LINE+=" ${KNOB_T[i]}:${KNOB_P[i]}"
-    done
+    line="# Knobs pwm1:"
+    for ((i = 0; i < ${#KNOB_T[@]}; i++)); do line+=" ${KNOB_T[i]}:${KNOB_P[i]}"; done
+    KNOB_LINES+=("$line")
+    if [[ -n "$GPU_KNOBS" ]]; then
+        line="# Knobs pwm2:"
+        for ((i = 0; i < ${#GPU_T[@]}; i++)); do line+=" ${GPU_T[i]}:${GPU_P[i]}"; done
+        KNOB_LINES+=("$line")
+    fi
 fi
 
 TMP="${FANCONFIG}.tmp.$$"
 trap 'rm -f "$TMP"' EXIT
 {
     echo "# Managed by fan-profile ($LABEL) — $NOW"
-    if [[ -n "$KNOB_LINE" ]]; then
-        echo "$KNOB_LINE"
+    if ((${#KNOB_LINES[@]})); then
+        printf '%s\n' "${KNOB_LINES[@]}"
         echo "# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX"
         echo "# values below are the fixed transfer calibration, not the curve."
     else
@@ -227,7 +278,8 @@ restore() {
     || restore "fancontrol --check rejected the new config"
 
 if [[ -n "$KNOBS" ]]; then
-    echo "wrote $FANCONFIG ($LABEL): ${#KNOB_T[@]} knobs${KNOB_LINE#\# Knobs:} on $FANHW via $FAN_CURVE (${#PWMS[@]} fan(s))"
+    echo "wrote $FANCONFIG ($LABEL): ${#KNOB_T[@]} knobs on pwm1 via $FAN_CURVE" \
+         "${GPU_KNOBS:+, ${#GPU_T[@]} knobs on pwm2 via $GPU_CURVE} (${#PWMS[@]} fan(s))"
 else
     echo "wrote $FANCONFIG ($LABEL): ${MINTEMP}C..${MAXTEMP}C pwm ${MINPWM}..${MAXPWM} on $FANHW/$TEMPHW (${#PWMS[@]} fan(s))"
 fi

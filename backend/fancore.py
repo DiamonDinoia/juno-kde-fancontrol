@@ -26,7 +26,24 @@ DEFAULT_PLATFORM = "/sys/devices/platform"
 # fan-profile: packaged in /usr/bin, hand-installed in /usr/local/bin.
 FAN_CURVE_PATHS = ("/usr/bin/juno-fan-curve", "/usr/local/bin/juno-fan-curve")
 DEFAULT_FAN_CURVE = next((p for p in FAN_CURVE_PATHS if os.path.exists(p)),
-                        FAN_CURVE_PATHS[0])
+                         FAN_CURVE_PATHS[0])
+# pwm1 cools the CPU, pwm2 the GPU/chassis (clevofan wiring for this board
+# family; the EC labels are the generic "Fan 1"/"Fan 2" and carry nothing).
+CPU_PWM, GPU_PWM = "pwm1", "pwm2"
+# The dGPU has no hwmon temperature: its sources are executable `!` entries like
+# the knob helper. juno-gpu-temp reports plain millidegrees (preset/custom-bands
+# mode), juno-gpu-curve the GPU knob curve as a virtual temperature (knob mode).
+DEFAULT_DGPU_PCI = "/sys/bus/pci/devices/0000:01:00.0"
+GPU_TEMP_PATHS = ("/usr/bin/juno-gpu-temp", "/usr/local/bin/juno-gpu-temp")
+DEFAULT_GPU_TEMP = next((p for p in GPU_TEMP_PATHS if os.path.exists(p)),
+                        GPU_TEMP_PATHS[0])
+GPU_CURVE_PATHS = ("/usr/bin/juno-gpu-curve", "/usr/local/bin/juno-gpu-curve")
+DEFAULT_GPU_CURVE = next((p for p in GPU_CURVE_PATHS if os.path.exists(p)),
+                         GPU_CURVE_PATHS[0])
+# A runtime-suspended dGPU honestly reports no temperature, and asking it would
+# wake it (~10 W). The fan it cools belongs at the floor of its curve then, so
+# every dGPU source synthesizes 25 C: below any sane first knob/band edge.
+COLD_DGPU_MILLIC = 25000
 MAX_KNOBS = 16
 
 # fancontrol interpolates ONE linear segment, so a multi-knob curve cannot be
@@ -227,20 +244,27 @@ def discover(platform_dir: str = DEFAULT_PLATFORM) -> Hwmon:
                  pwms=pwms, fans=fans)
 
 
-def knobs_line(knobs: tuple[tuple[int, int], ...]) -> str:
+def knobs_line(knobs: tuple[tuple[int, int], ...], pwm: str = CPU_PWM) -> str:
     """The knob list as the config comment fancontrol ignores and both
-    juno-fan-curve and `fan-profile regen` read back."""
-    return "# Knobs: " + " ".join(f"{t}:{pwm}" for t, pwm in knobs)
+    juno-fan-curve and `fan-profile regen` read back. One line per pwm."""
+    return f"# Knobs {pwm}: " + " ".join(f"{t}:{pwm_}" for t, pwm_ in knobs)
 
 
-_KNOBS_RE = re.compile(r"^# Knobs:((?:[ \t]+\d+:\d+)+)[ \t]*$", re.M)
+_KNOBS_TAGGED_RE = r"^# Knobs {pwm}:((?:[ \t]+\d+:\d+)+)[ \t]*$"
+_KNOBS_LEGACY_RE = re.compile(r"^# Knobs:((?:[ \t]+\d+:\d+)+)[ \t]*$", re.M)
 
 
-def parse_knobs(text: str) -> tuple[tuple[int, int], ...]:
-    """Knobs from a config, or () when the config is a native single-segment
-    curve. Never raises: a malformed line reads as 'no knobs' and the caller
-    falls back to the single-segment law that is also on disk."""
-    m = _KNOBS_RE.search(text)
+def parse_knobs(text: str, pwm: str = CPU_PWM) -> tuple[tuple[int, int], ...]:
+    """Knobs for one pwm from a config, or () when that pwm has none (native
+    single-segment curve). Never raises: a malformed line reads as 'no knobs'
+    and the caller falls back to the single-segment law that is also on disk.
+
+    Configs from before the GPU fan earned its own curve carry one untagged
+    `# Knobs:` line; that curve drove both fans off the CPU temperature, so it
+    reads back as the CPU pwm's knobs and only there."""
+    m = re.search(_KNOBS_TAGGED_RE.format(pwm=pwm), text, re.M)
+    if not m and pwm == CPU_PWM:
+        m = _KNOBS_LEGACY_RE.search(text)
     if not m:
         return ()
     return tuple((int(a), int(b))
@@ -248,31 +272,47 @@ def parse_knobs(text: str) -> tuple[tuple[int, int], ...]:
 
 
 def render_config(curve: Curve, hw: Hwmon, now: str,
-                  fan_curve: str = DEFAULT_FAN_CURVE) -> str:
+                  fan_curve: str = DEFAULT_FAN_CURVE,
+                  *, dgpu: bool = False,
+                  gpu_curve: "Curve | None" = None,
+                  gpu_helper: str = DEFAULT_GPU_CURVE,
+                  gpu_temp: str = DEFAULT_GPU_TEMP) -> str:
     """Byte-compatible with fan-profile's write_curve output: same two-line
     header (so `fan-profile status` parses the label), same key order and
     spacing. `now` is passed in so tests can compare byte-exact.
 
-    A knob curve additionally carries a `# Knobs:` line, points FCTEMPS at the
-    executable juno-fan-curve source, and pins the single segment to KNOB_XFER
-    so fancontrol writes back the helper's reported value divided by 1000."""
+    A knob curve additionally carries one `# Knobs <pwm>:` line per fan, points
+    FCTEMPS at the executable curve sources, and pins the single segment to
+    KNOB_XFER so fancontrol writes back the helper's reported value divided by
+    1000. With `dgpu` the GPU fan is driven by the dGPU temperature instead of
+    coretemp: juno-gpu-curve in knob mode, juno-gpu-temp otherwise."""
     c = curve
     f, t = hw.fan_hwmon, hw.temp_hwmon
+    if gpu_curve is not None and (not c.knobs or not gpu_curve.knobs):
+        raise ValueError("a GPU curve must be knobs, behind a knob CPU curve")
+    if c.knobs and dgpu and gpu_curve is None:
+        raise ValueError("a dGPU machine needs the GPU fan's own knobs: the "
+                         "CPU curve would drive pwm2 off the CPU temperature")
+
+    def source_for(p: str) -> str:
+        if p == GPU_PWM and dgpu:
+            return f"!{gpu_helper}" if c.knobs else f"!{gpu_temp}"
+        return f"!{fan_curve}" if c.knobs else f"{t}/{hw.temp_input}"
 
     def per_pwm(key: str, value: int) -> str:
         return key + "=" + " ".join(f"{f}/{p}={value}" for p in hw.pwms)
 
     if c.knobs:
         c = replace(c, **KNOB_XFER)
-        head = [knobs_line(curve.knobs),
-                "# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX",
-                "# values below are the fixed transfer calibration, not the curve."]
-        fctemps = " ".join(f"{f}/{p}=!{fan_curve}" for p in hw.pwms)
+        head = [knobs_line(curve.knobs, CPU_PWM)]
+        if gpu_curve is not None:
+            head.append(knobs_line(gpu_curve.knobs, GPU_PWM))
+        head += ["# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX",
+                 "# values below are the fixed transfer calibration, not the curve."]
     else:
         head = ["# Edit MIN/MAX values then run: fancontrol or fan-profile "
                 + (c.label if c.label in ("quiet", "balanced", "cool", "turbo")
                    else "quiet")]
-        fctemps = " ".join(f"{f}/{p}={t}/{hw.temp_input}" for p in hw.pwms)
 
     lines = [
         f"# Managed by fan-profile ({c.label}) — {now}",
@@ -280,7 +320,7 @@ def render_config(curve: Curve, hw: Hwmon, now: str,
         f"INTERVAL={c.interval}",
         f"DEVPATH={f}=devices/platform/clevofan {t}=devices/platform/coretemp.0",
         f"DEVNAME={f}={hw.fan_devname} {t}={hw.temp_devname}",
-        "FCTEMPS=" + fctemps,
+        "FCTEMPS=" + " ".join(f"{f}/{p}={source_for(p)}" for p in hw.pwms),
         "FCFANS=" + " ".join(f"{f}/{p}={f}/{fan}" for p, fan in zip(hw.pwms, hw.fans)),
     ]
     for key, value in (("MINTEMP", c.mintemp), ("MAXTEMP", c.maxtemp),
@@ -372,6 +412,38 @@ def read_sensors(hw: Hwmon, platform_dir: str = DEFAULT_PLATFORM) -> Sensors:
         rpms=tuple(_read_int(os.path.join(fan_dir, fan)) for fan in hw.fans),
         pwms=tuple(_read_int(os.path.join(fan_dir, pwm)) for pwm in hw.pwms),
         pwm_enables=tuple(_read_int(os.path.join(fan_dir, pwm + "_enable")) for pwm in hw.pwms))
+
+
+def dgpu_present(pci_dir: str = DEFAULT_DGPU_PCI) -> bool:
+    return os.path.isdir(pci_dir)
+
+
+def gpu_temp_millic(pci_dir: str = DEFAULT_DGPU_PCI,
+                    nvidia_smi: str = "nvidia-smi",
+                    platform_dir: str = DEFAULT_PLATFORM) -> int:
+    """dGPU temperature in millidegrees for the executable FCTEMPS sources.
+
+    Suspended → COLD_DGPU_MILLIC without touching the GPU: querying a suspended
+    card wakes it (~10 W), and the fan it cools belongs at its curve floor
+    then. Awake → nvidia-smi. A missing or failing nvidia-smi falls back to
+    coretemp instead of exiting non-zero: a permanently failing FCTEMPS source
+    aborts fancontrol into restorefans every INTERVAL, which cools worse than
+    following the CPU temperature on a machine whose driver stack is broken."""
+    from backend.sysmon import read_dgpu  # local: keeps the sampler out of the fan path
+    d = read_dgpu(pci_dir, nvidia_smi)
+    if not d.present:
+        raise HwmonNotFound(f"no dGPU at {pci_dir}")
+    if not d.powered:
+        return COLD_DGPU_MILLIC
+    if d.temp_c is not None:
+        return d.temp_c * 1000
+    try:
+        temp = read_sensors(discover(platform_dir), platform_dir).cpu_temp_c
+    except HwmonNotFound:
+        temp = None
+    if temp is None:
+        raise HwmonNotFound("nvidia-smi gave no temperature, coretemp also unreadable")
+    return int(round(temp * 1000))
 
 
 def service_state(systemctl: str = "systemctl") -> tuple[bool, bool]:

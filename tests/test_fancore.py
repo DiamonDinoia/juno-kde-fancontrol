@@ -9,10 +9,12 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from backend.fancore import (KNOB_XFER, MAX_KNOBS, Curve, HwmonNotFound,
-                             discover, parse_config, parse_knobs, parse_presets,
-                             pwm_percent, read_cap, read_sensors, render_config)
-from mktree import make_platform
+from backend.fancore import (COLD_DGPU_MILLIC, KNOB_XFER, MAX_KNOBS, Curve,
+                             HwmonNotFound, discover, dgpu_present,
+                             gpu_temp_millic, parse_config, parse_knobs,
+                             parse_presets, pwm_percent, read_cap, read_sensors,
+                             render_config)
+from mktree import make_dgpu, make_platform, write_fake_nvidia_smi
 
 HERE = Path(__file__).resolve().parent
 LEGACY_SNAPSHOT = HERE / "fixtures" / "juno-fancontrol-legacy"  # old /etc/fancontrol.d tree
@@ -271,7 +273,7 @@ KNOB_CURVE = Curve(interval=10, minstart=70, average=4, label="custom", knobs=KN
 
 EXPECTED_KNOB = """\
 # Managed by fan-profile (custom) — 2026-08-31 07:35
-# Knobs: 45:0 60:55 75:110 95:255
+# Knobs pwm1: 45:0 60:55 75:110 95:255
 # Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX
 # values below are the fixed transfer calibration, not the curve.
 INTERVAL=10
@@ -386,6 +388,121 @@ def test_knob_cap_clamp() -> None:
     assert KNOB_CURVE.clamped(255) is KNOB_CURVE       # nothing to do
     assert Curve(label="turbo", minstart=70, knobs=KNOBS,
                  ignore_cap=True).clamped(120).knobs == KNOBS
+
+
+# ---- GPU fan: own curve, own temperature source ----------------------------
+
+GPU_KNOBS = ((40, 0), (60, 80), (85, 255))
+GPU_CURVE = Curve(interval=10, minstart=70, average=4, label="custom",
+                  knobs=GPU_KNOBS)
+
+EXPECTED_DUAL_KNOB = """\
+# Managed by fan-profile (custom) — 2026-08-31 07:35
+# Knobs pwm1: 45:0 60:55 75:110 95:255
+# Knobs pwm2: 40:0 60:80 85:255
+# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX
+# values below are the fixed transfer calibration, not the curve.
+INTERVAL=10
+DEVPATH=hwmon7=devices/platform/clevofan hwmon10=devices/platform/coretemp.0
+DEVNAME=hwmon7=V5xTNC_TND_TNE hwmon10=coretemp
+FCTEMPS=hwmon7/pwm1=!/usr/bin/juno-fan-curve hwmon7/pwm2=!/usr/bin/juno-gpu-curve
+FCFANS=hwmon7/pwm1=hwmon7/fan1_input hwmon7/pwm2=hwmon7/fan2_input
+MINTEMP=hwmon7/pwm1=0 hwmon7/pwm2=0
+MAXTEMP=hwmon7/pwm1=255 hwmon7/pwm2=255
+MINSTART=hwmon7/pwm1=70 hwmon7/pwm2=70
+MINSTOP=hwmon7/pwm1=0 hwmon7/pwm2=0
+MINPWM=hwmon7/pwm1=0 hwmon7/pwm2=0
+MAXPWM=hwmon7/pwm1=255 hwmon7/pwm2=255
+AVERAGE=hwmon7/pwm1=4 hwmon7/pwm2=4
+"""
+
+
+def test_dual_knob_render_byte_exact(tmp_path: Path) -> None:
+    hw = discover(str(make_platform(tmp_path / "platform")))
+    got = render_config(KNOB_CURVE, hw, NOW, fan_curve="/usr/bin/juno-fan-curve",
+                        dgpu=True, gpu_curve=GPU_CURVE,
+                        gpu_helper="/usr/bin/juno-gpu-curve")
+    assert got == EXPECTED_DUAL_KNOB
+
+
+def test_dual_knob_roundtrip(tmp_path: Path) -> None:
+    hw = discover(str(make_platform(tmp_path / "platform")))
+    text = render_config(KNOB_CURVE, hw, NOW, dgpu=True, gpu_curve=GPU_CURVE,
+                         fan_curve="/usr/bin/juno-fan-curve",
+                         gpu_helper="/usr/bin/juno-gpu-curve")
+    assert parse_config(text).knobs == KNOBS            # pwm1, the parse default
+    assert parse_knobs(text, "pwm2") == GPU_KNOBS
+
+
+def test_native_render_with_dgpu_switches_only_pwm2(tmp_path: Path) -> None:
+    """Outside knob mode the GPU fan still follows the dGPU temperature,
+    through the plain millidegrees source."""
+    hw = discover(str(make_platform(tmp_path / "platform")))
+    text = render_config(QUIET, hw, NOW, dgpu=True,
+                         gpu_temp="/usr/bin/juno-gpu-temp")
+    assert ("FCTEMPS=hwmon7/pwm1=hwmon10/temp1_input "
+            "hwmon7/pwm2=!/usr/bin/juno-gpu-temp\n") in text
+    assert parse_config(text) == QUIET
+
+
+def test_render_refuses_split_asymmetry(tmp_path: Path) -> None:
+    """The card is there: a knob config without the GPU fan's own knobs would
+    drive pwm2 off the CPU temperature. Refuse instead of writing it."""
+    hw = discover(str(make_platform(tmp_path / "platform")))
+    with pytest.raises(ValueError, match="pwm2"):
+        render_config(KNOB_CURVE, hw, NOW, dgpu=True)
+    with pytest.raises(ValueError):
+        render_config(QUIET, hw, NOW, dgpu=True, gpu_curve=GPU_CURVE)
+    with pytest.raises(ValueError):
+        render_config(KNOB_CURVE, hw, NOW, dgpu=True, gpu_curve=QUIET)
+
+
+def test_legacy_knob_line_reads_as_pwm1_only() -> None:
+    text = "# Knobs: 45:0 95:255\n"
+    assert parse_knobs(text) == ((45, 0), (95, 255))          # pwm1
+    assert parse_knobs(text, "pwm2") == ()                    # never invented
+
+
+def test_dgpu_present(tmp_path: Path) -> None:
+    pci = make_dgpu(tmp_path / "pci")
+    assert dgpu_present(str(pci))
+    assert not dgpu_present(str(tmp_path / "nope"))
+
+
+def test_gpu_temp_suspended_synthesizes_cold_without_waking(tmp_path: Path) -> None:
+    pci = make_dgpu(tmp_path / "pci", awake=False)
+    log = tmp_path / "smi.log"
+    smi = write_fake_nvidia_smi(tmp_path / "nvidia-smi", log)
+    assert gpu_temp_millic(str(pci), str(smi)) == COLD_DGPU_MILLIC
+    # The whole point of the power-state-first ordering: the card was not asked.
+    assert not log.exists() or not log.read_text()
+
+
+def test_gpu_temp_awake_reports_smi(tmp_path: Path) -> None:
+    pci = make_dgpu(tmp_path / "pci", awake=True)
+    smi = write_fake_nvidia_smi(tmp_path / "nvidia-smi", tmp_path / "smi.log",
+                                temp_c=67)
+    assert gpu_temp_millic(str(pci), str(smi)) == 67000
+
+
+def test_gpu_temp_falls_back_to_coretemp_when_smi_fails(tmp_path: Path) -> None:
+    """A broken driver stack must not abort fancontrol into restorefans every
+    INTERVAL; the GPU fan following coretemp is the better bad."""
+    pci = make_dgpu(tmp_path / "pci", awake=True)
+    smi = write_fake_nvidia_smi(tmp_path / "nvidia-smi", tmp_path / "smi.log",
+                                fail=True)
+    platform = make_platform(tmp_path / "platform", temp_millic=71000)
+    assert gpu_temp_millic(str(pci), str(smi), platform_dir=str(platform)) == 71000
+
+
+def test_gpu_temp_errors_when_nothing_is_there(tmp_path: Path) -> None:
+    with pytest.raises(HwmonNotFound):
+        gpu_temp_millic(str(tmp_path / "absent"))
+    pci = make_dgpu(tmp_path / "pci", awake=True)
+    smi = write_fake_nvidia_smi(tmp_path / "nvidia-smi", tmp_path / "smi.log",
+                                fail=True)
+    with pytest.raises(HwmonNotFound, match="coretemp"):
+        gpu_temp_millic(str(pci), str(smi), platform_dir=str(tmp_path / "empty"))
 
 
 def test_knob_transfer_is_exact_through_the_real_fancontrol_law() -> None:
