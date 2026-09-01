@@ -206,6 +206,15 @@ pymutate M33-render-drops-gpu-knobs backend/fancore.py \
             head.append(knobs_line(gpu_curve.knobs, GPU_PWM))
 ' ''
 
+# --- tray probes ---
+# A setting that is read but never written flips the panel only until the next
+# start; the persistence test measures exactly that.
+mutate M34-probe-toggle-not-saved tray.py \
+    '/self.settings.setValue(f"probes\/{key}", on)/d'
+# A set_probe that ignores the store reads as all-on everywhere.
+mutate M35-probe-on-ignores-store tray.py \
+    's|return self.settings.value(f"probes/{key}", True, type=bool)|return True|'
+
 restore
 echo "== after restore: $(run)"
 echo "== fired=$FIRED missed=$MISSED"

@@ -167,25 +167,39 @@ def tray_rubric(name: str, d: dict) -> list[str]:
     errs = []
     if not d.get("panel_visible"):
         errs.append("panel not visible")
-    if not d.get("utilization_chart"):
-        errs.append("utilization chart missing")
-    if not d.get("chart_has_line"):
-        errs.append("no line drawn in the chart")
     rows = {str(k).strip().lower(): str(v) for k, v in (d.get("rows") or {}).items()}
-    for want in ("cpu", "fans", "igpu", "dgpu", "net", "battery"):
-        if want not in rows:
-            errs.append(f"row '{want}' missing (saw: {sorted(rows)})")
+    if name == "tray-min":
+        # The customized shot: five probes on, the rest off. A layout defect that
+        # resurrects a hidden row, or hides a visible one, must not pass.
+        # Labels are transcribed verbatim off the panel: "CPU fan", "GPU fan".
+        for want in ("cpu", "gpu", "cpu fan", "gpu fan", "net"):
+            if want not in rows:
+                errs.append(f"tray-min row '{want}' missing (saw: {sorted(rows)})")
+        for gone in ("igpu", "power", "battery"):
+            if gone in rows:
+                errs.append(f"tray-min should hide '{gone}', it is present")
+        if d.get("utilization_chart"):
+            errs.append("tray-min should have no chart, one is drawn")
+    else:
+        if not d.get("utilization_chart"):
+            errs.append("utilization chart missing")
+        if not d.get("chart_has_line"):
+            errs.append("no line drawn in the chart")
+        for want in ("cpu", "gpu", "cpu fan", "gpu fan", "igpu", "net", "battery"):
+            if want not in rows:
+                errs.append(f"row '{want}' missing (saw: {sorted(rows)})")
     if not re.search(r"\d+\s*°?\s*c", rows.get("cpu", ""), re.I):
         errs.append(f"CPU row has no temperature: {rows.get('cpu', '')!r}")
-    if "rpm" not in rows.get("fans", "").lower():
-        errs.append(f"FANS row has no RPM: {rows.get('fans', '')!r}")
-    if "/s" not in rows.get("net", ""):
-        errs.append(f"NET row has no transfer rate: {rows.get('net', '')!r}")
+    for fan in ("cpu fan", "gpu fan"):
+        if fan in rows and "rpm" not in rows[fan].lower():
+            errs.append(f"{fan} row has no RPM: {rows[fan]!r}")
+    if "net" in rows and "/s" not in rows["net"]:
+        errs.append(f"NET row has no transfer rate: {rows['net']!r}")
     if name.endswith("dark") and not d.get("is_dark_theme"):
         errs.append("dark shot does not look dark")
     if name.endswith("off") and not re.search(r"suspend|off|absent|d3",
-                                              rows.get("dgpu", ""), re.I):
-        errs.append(f"suspended-dGPU shot does not say so: {rows.get('dgpu', '')!r}")
+                                              rows.get("gpu", ""), re.I):
+        errs.append(f"suspended-dGPU shot does not say so: {rows.get('gpu', '')!r}")
     defects = str(d.get("defects", "")).strip().lower()
     if defects not in ("none", "", "no defects"):
         errs.append(f"defects reported: {defects}")

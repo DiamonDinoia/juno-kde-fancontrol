@@ -70,8 +70,9 @@ def test_tray_shots_get_the_tray_prompt():
 
 def test_tray_rubric_flags_a_missing_chart():
     good = {"panel_visible": True, "utilization_chart": True, "chart_has_line": True,
-            "rows": {"CPU": "74 °C 44% busy", "FANS": "fan1 2560 RPM",
-                     "IGPU": "23% busy", "DGPU": "61 °C", "NET": "down 1.0 kB/s",
+            "rows": {"CPU": "74 °C 44% busy", "GPU": "NVIDIA 61 °C 44% busy",
+                     "CPU fan": "2560 RPM 31%", "GPU fan": "2480 RPM 31%",
+                     "IGPU": "23% busy", "NET": "down 1.0 kB/s",
                      "POWER": "32 W", "BATTERY": "77%"},
             "is_dark_theme": False, "defects": "none"}
     assert vision_check.tray_rubric("tray", good) == []
@@ -79,6 +80,25 @@ def test_tray_rubric_flags_a_missing_chart():
     assert vision_check.tray_rubric("tray", {**good, "rows": {}})
     assert vision_check.tray_rubric("tray-dark", good), "dark shot must look dark"
     assert vision_check.tray_rubric("tray-off", good), "suspended shot must say so"
+    bare_gpu = {**good["rows"], "GPU": "off — suspended"}
+    assert vision_check.tray_rubric("tray-off", {**good, "rows": bare_gpu}) == []
+
+
+def test_tray_rubric_pins_the_customized_layout():
+    """tray-min must show exactly the enabled probes: a leak of a hidden row, or
+    a missing visible one, is a defect the rubric has to name."""
+    good = {"panel_visible": True, "utilization_chart": False,
+            "rows": {"CPU": "74 °C 44% busy", "GPU": "NVIDIA 61 °C",
+                     "CPU fan": "2560 RPM 31%", "GPU fan": "2480 RPM 31%",
+                     "NET": "down 1.0 kB/s"},
+            "is_dark_theme": False, "defects": "none"}
+    assert vision_check.tray_rubric("tray-min", good) == []
+    leaked = {**good, "rows": {**good["rows"], "BATTERY": "77%"}}
+    assert vision_check.tray_rubric("tray-min", leaked)
+    lost = {**good, "rows": {k: v for k, v in good["rows"].items() if k != "GPU fan"}}
+    assert vision_check.tray_rubric("tray-min", lost)
+    charted = {**good, "utilization_chart": True}
+    assert vision_check.tray_rubric("tray-min", charted)
 
 
 def test_knob_rubric_needs_multiple_handles() -> None:

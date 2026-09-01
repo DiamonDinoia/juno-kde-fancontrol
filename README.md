@@ -226,8 +226,10 @@ invisible to it, `sync()` included.
 
 - Rolling 90-sample chart of CPU, iGPU and dGPU utilization. The dGPU joins
   the chart only while it is awake.
-- Fan RPM and PWM duty, read through the same `backend/fancore.py` the
-  editor uses.
+- CPU and GPU fan, one row each: RPM and PWM duty, read through the same
+  `backend/fancore.py` the editor uses.
+- Every row and the chart is individually switchable (tray menu → **Probes…**),
+  and the choice persists across restarts.
 - iGPU busy % from i915 RC6 residency and the current/max render clock. The
   i915 PMU needs `CAP_PERFMON`, so RC6 residency is what an unprivileged
   process can read.

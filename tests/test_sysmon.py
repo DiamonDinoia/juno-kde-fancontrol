@@ -323,7 +323,7 @@ def test_the_panel_rethemes_when_the_scheme_changes(tmp_path: Path) -> None:
     orig = traymod.ktheme.kdeglobals
     traymod.ktheme.kdeglobals = lambda: str(f)
     try:
-        panel = traymod.Panel(argparse.Namespace())
+        panel = traymod.Panel(argparse.Namespace(settings=None))
         panel.setPalette(light)
         panel.retheme()
         assert "#ff0000" in panel.hint.styleSheet()

@@ -43,6 +43,8 @@ def main() -> int:
     ap.add_argument("--style", default="fusion")
     ap.add_argument("--hide-chart", action="store_true",
                     help="defect control: render the panel without its chart")
+    ap.add_argument("--probes", default="",
+                    help="comma-separated probes to disable, e.g. 'battery,net'")
     args = ap.parse_args()
 
     work = Path(tempfile.mkdtemp(prefix="jfc-tray-"))
@@ -50,6 +52,13 @@ def main() -> int:
                                  battery={"status": args.battery})
     platform = work / "sys"
     mktree.make_platform(platform)
+
+    settings = work / "settings.ini"
+    disabled = [p for p in args.probes.split(",") if p]
+    if disabled:
+        # probe keys all live in [probes], including the chart's
+        with settings.open("a") as f:
+            f.write("[probes]\n" + "".join(f"{p}=false\n" for p in disabled))
 
     smi = work / "nvidia-smi"
     smi.write_text("#!/bin/sh\nprintf '%s' '61, 44, 38.5, 1536'\n")
@@ -65,7 +74,7 @@ def main() -> int:
         sysfs=str(platform), stat=str(root / "stat"), net=str(root / "net_dev"),
         net_class=str(root / "net_class"), gt=str(root / "gt0"),
         dgpu_pci=str(root / "dgpu"), power_supply=str(root / "power_supply"),
-        rapl=str(root / "rapl"), nvidia_smi=str(smi),
+        rapl=str(root / "rapl"), nvidia_smi=str(smi), settings=str(settings),
         interval=10 ** 6,        # the harness drives refresh, not the timer
         screenshot=None, screenshot_samples=0, dark=args.dark)
     mon = traymod.Monitor(ns, qapp)

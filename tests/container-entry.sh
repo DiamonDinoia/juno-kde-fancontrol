@@ -46,6 +46,8 @@ check render-tray       "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray.pn
 check render-tray-dark  "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-dark.png --dark
 check render-tray-off   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-off.png \
                             --dgpu suspended --battery "Not charging"
+check render-tray-min   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-min.png \
+                            --probes igpu,power,battery,chart
 mkdir -p /out/control
 check render-control    "$PYTHON" "$SRC/tests/render_app.py"  --out /out/control/nochart.png --preset quiet --hide-chart
 check render-tray-ctl   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/control/tray-nochart.png --hide-chart

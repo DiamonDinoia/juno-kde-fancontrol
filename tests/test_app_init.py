@@ -36,11 +36,6 @@ def _ns(tmp_path, **over):
     return argparse.Namespace(**base)
 
 
-@pytest.fixture(scope="session")
-def qapp():
-    return QApplication(["test"])
-
-
 @pytest.fixture(autouse=True)
 def no_modals(monkeypatch):
     """`QMessageBox.warning` is modal, so an unexpected invalid curve blocks the

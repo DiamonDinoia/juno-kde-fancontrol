@@ -1,3 +1,16 @@
+juno-kde-fancontrol (0.5.0+diamon1) unstable; urgency=low
+
+  * The tray panel is customizable: every probe (CPU, GPU, the two fans, iGPU,
+    network, power, battery) and the utilization chart can be switched on and
+    off from the tray menu's Probes dialog, and the choice persists in
+    QSettings across restarts.
+  * The fans row splits into "CPU fan" and "GPU fan" (RPM plus PWM duty each),
+    and the card gets its own "GPU" row, rather than sharing one opaque line.
+    A one-fan machine reports the GPU fan as absent; a machine without clevofan
+    degrades cleanly.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Tue, 01 Sep 2026 12:10:00 -0400
+
 juno-kde-fancontrol (0.4.0+diamon1) unstable; urgency=low
 
   * The GPU fan gets its own curve on dGPU machines. pwm1 keeps the CPU

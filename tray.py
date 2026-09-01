@@ -19,10 +19,11 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, Qt, QTimer
 from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QIcon, QPainter,
                            QPalette, QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QGridLayout, QLabel, QMenu,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
+                               QGridLayout, QLabel, QMenu,
                                QSizePolicy, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 from backend import ktheme
@@ -110,6 +111,46 @@ class Sparkline(QWidget):
         p.end()
 
 
+# The probes the panel can show, in panel order. Every one is individually
+# switchable; the choice persists in QSettings (tray context menu -> Probes...).
+PROBES: tuple[tuple[str, str], ...] = (
+    ("cpu", "CPU"),
+    ("gpu", "GPU"),
+    ("fan-cpu", "CPU fan"),
+    ("fan-gpu", "GPU fan"),
+    ("igpu", "iGPU"),
+    ("net", "NET"),
+    ("power", "POWER"),
+    ("battery", "BATTERY"),
+)
+
+
+def probe_settings(args: argparse.Namespace) -> QSettings:
+    """--settings exists so tests and renders never touch the real store."""
+    if args.settings:
+        return QSettings(args.settings, QSettings.Format.IniFormat)
+    return QSettings("juno", "juno-fan-monitor")
+
+
+class ProbesDialog(QDialog):
+    """Non-modal checkbox list; each toggle writes through immediately and the
+    panel reflows on the next tick. Stays above the always-on-top tray popup."""
+
+    def __init__(self, panel: "Panel") -> None:
+        super().__init__(None, Qt.WindowType.Dialog)
+        self.setWindowTitle("Probes — Juno system monitor")
+        self.panel = panel
+        lay = QVBoxLayout(self)
+        for key, label in (*PROBES, ("chart", "Utilization chart")):
+            cb = QCheckBox(label)
+            cb.setChecked(panel.probe_on(key))
+            cb.toggled.connect(lambda on, k=key: panel.set_probe(k, on))
+            lay.addWidget(cb)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+
 class Panel(QWidget):
     """The popup. A plain Popup window so it closes when focus moves away."""
 
@@ -117,28 +158,45 @@ class Panel(QWidget):
         super().__init__(None, Qt.WindowType.Popup)
         self.args = args
         self.setWindowTitle("Juno system monitor")
+        self.settings = probe_settings(args)
 
         root = QVBoxLayout(self)
         self.chart = Sparkline()
         root.addWidget(self.chart)
 
-        self.rows: dict[str, QLabel] = {}
+        self.row_widgets: dict[str, tuple[QLabel, QLabel]] = {}
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
         root.addLayout(grid)
-        for i, key in enumerate(("cpu", "fans", "igpu", "dgpu", "net", "power", "battery")):
-            name = QLabel(key.upper())
+        for i, (key, label) in enumerate(PROBES):
+            name = QLabel(label)
             name.setStyleSheet("font-weight: bold")
             value = QLabel("—")
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             grid.addWidget(name, i, 0, Qt.AlignmentFlag.AlignRight)
             grid.addWidget(value, i, 1)
-            self.rows[key] = value
+            self.row_widgets[key] = (name, value)
 
         self.hint = QLabel("")
         self.hint.setWordWrap(True)
         root.addWidget(self.hint)
+        self.apply_probe_visibility()
         self.retheme()
+
+    def probe_on(self, key: str) -> bool:
+        return self.settings.value(f"probes/{key}", True, type=bool)
+
+    def set_probe(self, key: str, on: bool) -> None:
+        self.settings.setValue(f"probes/{key}", on)
+        self.settings.sync()
+        self.apply_probe_visibility()
+
+    def apply_probe_visibility(self) -> None:
+        for key, (name, value) in self.row_widgets.items():
+            name.setVisible(self.probe_on(key))
+            value.setVisible(self.probe_on(key))
+        self.chart.setVisible(self.probe_on("chart"))
+        self.adjustSize()
 
     def retheme(self) -> None:
         """Re-resolve the scheme colours and repaint. An inline stylesheet wins
@@ -162,7 +220,7 @@ class Panel(QWidget):
         super().changeEvent(e)
 
     def set_row(self, key: str, text: str) -> None:
-        self.rows[key].setText(text)
+        self.row_widgets[key][1].setText(text)
 
 
 class Monitor:
@@ -186,8 +244,11 @@ class Monitor:
         menu = QMenu()
         fan_gui = QAction("Fan control…", menu)
         fan_gui.triggered.connect(self.launch_fan_gui)
+        probes = QAction("Probes…", menu)
+        probes.triggered.connect(self.show_probes)
         quit_action = QAction("Quit", menu)
         quit_action.triggered.connect(app.quit)
+        menu.addAction(probes)
         menu.addAction(fan_gui)
         menu.addSeparator()
         menu.addAction(quit_action)
@@ -239,17 +300,32 @@ class Monitor:
         from PySide6.QtCore import QProcess
         QProcess.startDetached("juno-kde-fancontrol", [])
 
+    def show_probes(self) -> None:
+        # One dialog instance, raised on repeat activations.
+        if getattr(self, "_probes", None) is None:
+            self._probes = ProbesDialog(self.panel)
+            self._probes.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self._probes.show()
+        self._probes.raise_()
+        self._probes.activateWindow()
+
     # -- data ---------------------------------------------------------------
     def refresh(self) -> None:
         s = self.sampler.sample()
-        temp_c, fan_text = None, "clevofan not found"
+        temp_c = None
+        fan_rows = ("clevofan not found", "n/a")
         if self.hw is not None:
             fan = read_sensors(self.hw, self.args.sysfs)
             temp_c = fan.cpu_temp_c
-            rpms = "  ".join(f"fan{i + 1} {r if r is not None else 'n/a'} RPM"
-                             for i, r in enumerate(fan.rpms))
-            pwms = "  ".join(pwm_percent(v) for v in fan.pwms)
-            fan_text = f"{rpms}   pwm {pwms}"
+
+            def fan_row(i: int) -> str:
+                if i >= len(fan.rpms):
+                    return "absent"
+                rpm = fan.rpms[i]
+                pwm = fan.pwms[i] if i < len(fan.pwms) else None
+                return f"{rpm if rpm is not None else 'n/a'} RPM   {pwm_percent(pwm)}"
+
+            fan_rows = (fan_row(0), fan_row(1))
 
         self.tray.setIcon(self.paint_icon(temp_c))
         k = ktheme.colors(self.panel.palette())
@@ -264,7 +340,8 @@ class Monitor:
         cpu_txt = "n/a" if s.cpu_pct is None else f"{s.cpu_pct:.0f}% busy"
         temp_txt = "n/a" if temp_c is None else f"{temp_c:.0f} °C"
         self.panel.set_row("cpu", f"{temp_txt}   {cpu_txt}")
-        self.panel.set_row("fans", fan_text)
+        self.panel.set_row("fan-cpu", fan_rows[0])
+        self.panel.set_row("fan-gpu", fan_rows[1])
 
         igpu = "n/a" if s.igpu_pct is None else f"{s.igpu_pct:.0f}% busy"
         # rps_act_freq reads 0 whenever the sample lands inside an RC6 window,
@@ -283,7 +360,7 @@ class Monitor:
         else:
             dgpu_txt = (f"{d.temp_c} °C   {d.util_pct}% busy   {d.power_w:.1f} W"
                         f"   {d.memory_mb} MiB")
-        self.panel.set_row("dgpu", f"NVIDIA   {dgpu_txt}")
+        self.panel.set_row("gpu", f"NVIDIA   {dgpu_txt}")
 
         self.panel.set_row("net", f"down {fmt_rate(s.net_rx_bps)}   "
                                   f"up {fmt_rate(s.net_tx_bps)}"
@@ -318,7 +395,8 @@ class Monitor:
         else:
             self.panel.hint.setText("")
 
-        self.tray.setToolTip(f"CPU {temp_txt}  {cpu_txt}\n{fan_text}\n"
+        self.tray.setToolTip(f"CPU {temp_txt}  {cpu_txt}\n"
+                             f"CPU fan {fan_rows[0]}\nGPU fan {fan_rows[1]}\n"
                              f"GPU {dgpu_txt}\n{power_txt}")
 
 
@@ -334,6 +412,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--rapl", default=DEFAULT_RAPL)
     ap.add_argument("--nvidia-smi", default="nvidia-smi")
     ap.add_argument("--interval", type=int, default=2000, help="refresh period, ms")
+    ap.add_argument("--settings", default=None,
+                    help="QSettings ini file override (tests/renders; default: platform store)")
     ap.add_argument("--screenshot", help="render the panel and exit")
     ap.add_argument("--screenshot-samples", type=int, default=40,
                     help="samples to collect before the screenshot, at --interval")

@@ -30,11 +30,6 @@ ForegroundPositive=200,200,200
 """
 
 
-@pytest.fixture(scope="session")
-def qapp():
-    return QApplication.instance() or QApplication(["test"])
-
-
 def _light_palette() -> QPalette:
     """An explicit light window. The tests below assert the scheme's own values
     come through, and _inactive only returns those if they are legible on the
