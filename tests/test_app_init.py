@@ -14,7 +14,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 import app as fanapp  # noqa: E402
-from mktree import make_platform, write_fake_systemctl  # noqa: E402
+from mktree import (make_dgpu, make_platform,  # noqa: E402
+                    write_fake_nvidia_smi, write_fake_systemctl)
 
 
 def _ns(tmp_path, **over):
@@ -27,6 +28,9 @@ def _ns(tmp_path, **over):
         cap=str(work / "fan-profile.maxpwm"),
         systemctl=str(write_fake_systemctl(tmp_path / "systemctl", tmp_path / "ctl.log")),
         screenshot=None, dark=False, preset=None, auto=False, no_apply=True,
+        # No card by default: a stray /sys path away from the fixture, so the
+        # GPU branch only appears where a test builds one.
+        dgpu_pci=str(tmp_path / "no-dgpu"), smi="nvidia-smi", fan="cpu",
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -406,3 +410,101 @@ def test_dark_palette_keeps_disabled_text_distinct(qapp) -> None:
     dim = pal.color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText)
     assert dim != normal
     assert fanapp.ktheme.colors(pal, path="").inactive == dim
+
+
+# ---- the GPU fan -----------------------------------------------------------
+
+def _knob_window_dgpu(tmp_path, qapp, *, preset="quiet", awake=True, temp_c=67):
+    """A MainWindow on a machine with a (fake) dGPU: sysfs PCI fixture plus a
+    fake nvidia-smi, and the applied-config fixtures the knob tests use."""
+    make_platform(tmp_path / "sys")
+    pci = make_dgpu(tmp_path / "pci", awake=awake)
+    smi = write_fake_nvidia_smi(tmp_path / "smi", tmp_path / "smi.log", temp_c=temp_c)
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "fan-profile")
+    w = fanapp.MainWindow(_ns(tmp_path, fan_profile=fixture, preset=preset,
+                              dgpu_pci=str(pci), smi=str(smi)))
+    w.resize(900, 600)
+    w.canvas.resize(520, 380)
+    return w
+
+
+def test_gpu_selector_only_with_a_card(tmp_path, qapp) -> None:
+    w = _knob_window(tmp_path, qapp)
+    assert not hasattr(w, "fan_buttons")
+    w = _knob_window_dgpu(tmp_path, qapp)
+    assert set(w.fan_buttons) == {"cpu", "gpu"}
+    # A one-canvas-per-role bug would be invisible on the CPU default.
+    assert w.sel == "cpu"
+
+
+def test_gpu_curve_is_independent_of_the_cpu_curve(tmp_path, qapp) -> None:
+    w = _knob_window_dgpu(tmp_path, qapp)
+    w.select_fan("gpu")
+    _click(w.canvas, 70, 120)
+    assert w.canvas.curve.knobs, "the GPU click did not add a knob"
+    # The CPU curve must not have moved: it was stowed, not shared.
+    assert not w.curves["cpu"].knobs
+    assert w.curves["gpu"] is None or not w.curves["gpu"].knobs  # stow happens on read
+    assert w.curve_from_editor("gpu").knobs
+
+
+def test_apply_sends_both_knob_lists(tmp_path, qapp) -> None:
+    w = _knob_window_dgpu(tmp_path, qapp)
+    _click(w.canvas, 80, 100)                  # cpu fan: knob mode engaged
+    w.select_fan("gpu")
+    _click(w.canvas, 70, 110)                  # gpu fan: own curve
+    w.on_apply()
+    out = w.result.text()
+    assert "--knobs" in out and "--gpu-knobs" in out
+    assert "70:110" in out and "80:100" in out
+
+
+def test_apply_converts_the_native_side(tmp_path, qapp) -> None:
+    """Knob mode is per-config: one fan in knobs sends the other as its exact
+    as_knobs() conversion, because the helper writes them together."""
+    w = _knob_window_dgpu(tmp_path, qapp)
+    w.select_fan("gpu")
+    _click(w.canvas, 70, 110)                  # gpu knobs; cpu stays 2-point ramp
+    w.on_apply()
+    out = w.result.text()
+    assert "--gpu-knobs" in out
+    # quiet is 60C off .. 95C at 120; the step knob sits one degree below MINTEMP.
+    assert "59:0 60:50 95:120" in out
+
+
+def test_status_line_reports_the_card(tmp_path, qapp) -> None:
+    w = _knob_window_dgpu(tmp_path, qapp, awake=True, temp_c=67)
+    w.refresh_sensors()
+    assert "GPU 67 °C" in w.status.text()
+    w2 = _knob_window_dgpu(tmp_path / "s", qapp, awake=False)
+    w2.refresh_sensors()
+    assert "GPU suspended" in w2.status.text()
+    assert not (tmp_path / "s" / "smi.log").exists()  # the card was not woken
+
+
+def test_gpu_knobs_load_from_disk(tmp_path, qapp) -> None:
+    """A dual config on disk must come back as two curves, one per fan."""
+    import backend.fancore as fc
+    platform = make_platform(tmp_path / "sys")
+    text = fc.render_config(
+        fc.Curve(label="custom", minstart=70, knobs=((45, 0), (95, 130))),
+        fc.discover(str(platform)), "2026-08-31 07:35",
+        fan_curve="/usr/bin/juno-fan-curve", dgpu=True,
+        gpu_curve=fc.Curve(label="custom", minstart=70, knobs=((40, 0), (85, 255))),
+        gpu_helper="/usr/bin/juno-gpu-curve")
+    w = _knob_window_dgpu(tmp_path, qapp)
+    (tmp_path / "etc" / "fancontrol").write_text(text)
+    w.load_all()
+    assert w.curve_from_editor("cpu").knobs == ((45, 0), (95, 130))
+    assert w.curve_from_editor("gpu").knobs == ((40, 0), (85, 255))
+    w.select_fan("gpu")
+    assert [t for t, _ in w.canvas.curve.knobs] == [40, 85]
+
+
+def test_live_marker_follows_the_selected_fan(tmp_path, qapp) -> None:
+    w = _knob_window_dgpu(tmp_path, qapp, temp_c=67)
+    w.refresh_sensors()
+    assert w.canvas.live_temp == pytest.approx(74.0)   # coretemp fixture
+    w.select_fan("gpu")
+    w.refresh_sensors()
+    assert w.canvas.live_temp == pytest.approx(67.0)

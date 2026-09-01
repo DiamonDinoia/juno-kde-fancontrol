@@ -110,3 +110,21 @@ def test_two_point_rubric_rejects_a_knob_answer() -> None:
     assert vision_check.rubric("shot-quiet", base) == []
     errs = vision_check.rubric("shot-quiet", {**base, "curve_handles": 5})
     assert any("2-point shot should show 2 handles" in e for e in errs), errs
+
+
+def test_gpu_knob_rubric_needs_the_gpu_evidence() -> None:
+    """The GPU shot passes only if the selector and the GPU temperature made it
+    into the picture — a render of the CPU tab by another name must not pass."""
+    good = dict(window_visible=True, curve_chart=True, chart_has_line=True,
+                axis_labels=["GPU temperature (°C)"],
+                buttons=["CPU fan (pwm1)", "GPU fan (pwm2)", "Quiet", "Turbo",
+                         "Apply", "Automatic (EC firmware)", "Back to 2-point"],
+                status_line="CPU 74 °C  fan1 2560 RPM  GPU 67 °C", is_dark_theme=False,
+                curve_handles=4, curve_shape="multi-segment", defects="none")
+    assert vision_check.rubric("shot-gpu-knobs", good) == []
+    assert vision_check.rubric("shot-gpu-knobs", {**good, "curve_handles": 2})
+    assert vision_check.rubric("shot-gpu-knobs",
+                               {**good, "buttons": [b for b in good["buttons"]
+                                                    if "GPU" not in b]})
+    assert vision_check.rubric("shot-gpu-knobs",
+                               {**good, "status_line": "CPU 74 °C  fan1 2560 RPM"})

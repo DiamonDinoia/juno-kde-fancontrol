@@ -39,6 +39,11 @@ def main() -> int:
     ap.add_argument("--knobs", default="",
                     help='knob curve as "T:P T:P ...": renders the multi-point '
                          "editor instead of the two-point ramp")
+    ap.add_argument("--gpu-knobs", default="",
+                    help="GPU fan's knob curve; needs --dgpu and --knobs")
+    ap.add_argument("--dgpu", action="store_true",
+                    help="give the fixture a dGPU (PCI dir + fake nvidia-smi)")
+    ap.add_argument("--fan", choices=("cpu", "gpu"), default="cpu")
     ap.add_argument("--hide-chart", action="store_true",
                     help="render without the curve chart: the defect control the "
                          "vision rubric must flag (tools/vision_check.py)")
@@ -51,16 +56,37 @@ def main() -> int:
     etc.mkdir()
     (etc / "fan-profile.maxpwm").write_text("150\n")
 
+    pci = str(work / "no-dgpu")
+    smi = "nvidia-smi"
+    if args.dgpu:
+        pci = str(mktree.make_dgpu(work / "pci", awake=True))
+        smi = str(mktree.write_fake_nvidia_smi(work / "nvidia-smi",
+                                               work / "smi.log", temp_c=67))
+
     curve = parse_presets(FIXTURE_FP.read_text())[args.preset]
+    gpu_curve = None
     if args.knobs:
         knobs = tuple(tuple(map(int, kv.split(":"))) for kv in args.knobs.split())
         curve = Curve(interval=curve.interval, minstart=curve.minstart,
                       average=curve.average, label="custom", knobs=knobs)
         curve.validate()
+        if args.gpu_knobs:
+            gk = tuple(tuple(map(int, kv.split(":"))) for kv in args.gpu_knobs.split())
+            gpu_curve = Curve(interval=curve.interval, minstart=curve.minstart,
+                              average=curve.average, label="custom", knobs=gk)
+            gpu_curve.validate()
+        elif args.dgpu:
+            # A dGPU render in knob mode cannot name no GPU curve (render_ref
+            # refuses the asymmetry); mirror the editor's seeding instead.
+            gpu_curve = Curve(interval=curve.interval, minstart=curve.minstart,
+                              average=curve.average, label="custom", knobs=knobs)
     hw = discover(str(platform))
     config = etc / "fancontrol"
     config.write_text(render_config(curve.clamped(None if curve.ignore_cap else 150),
-                                    hw, NOW, fan_curve="/usr/bin/juno-fan-curve"))
+                                    hw, NOW, fan_curve="/usr/bin/juno-fan-curve",
+                                    dgpu=args.dgpu, gpu_curve=gpu_curve,
+                                    gpu_helper="/usr/bin/juno-gpu-curve",
+                                    gpu_temp="/usr/bin/juno-gpu-temp"))
 
     fakectl = mktree.write_fake_systemctl(work / "systemctl", work / "systemctl.log")
 
@@ -72,7 +98,8 @@ def main() -> int:
     ns = argparse.Namespace(sysfs=str(platform), config=str(config),
                             fan_profile=str(FIXTURE_FP), cap=str(etc / "fan-profile.maxpwm"),
                             systemctl=str(fakectl), screenshot=None, dark=args.dark,
-                            preset=None, auto=args.auto, no_apply=True)
+                            preset=None, auto=args.auto, no_apply=True,
+                            dgpu_pci=pci, smi=smi, fan=args.fan)
     win = fanapp.MainWindow(ns)
     if args.hide_chart:
         win.canvas.hide()

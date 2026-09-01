@@ -142,7 +142,7 @@ def rubric(name: str, d: dict) -> list[str]:
     # answers "5" fails the 2-point shots and one that always answers "2" fails
     # the knob shot. Either way the field carries information.
     handles = d.get("curve_handles")
-    if name == "shot-knobs":
+    if name in ("shot-knobs", "shot-gpu-knobs"):
         if not isinstance(handles, int) or handles < 4:
             errs.append(f"knob shot should show 5 handles on the curve, saw {handles!r}")
         if str(d.get("curve_shape", "")).lower().startswith("straight"):
@@ -152,6 +152,11 @@ def rubric(name: str, d: dict) -> list[str]:
     elif name.startswith("shot-"):
         if not isinstance(handles, int) or handles > 3:
             errs.append(f"2-point shot should show 2 handles, saw {handles!r}")
+    if name == "shot-gpu-knobs":
+        if "gpu fan" not in buttons:
+            errs.append(f"gpu shot missing the fan selector (saw: {buttons!r})")
+        if not re.search(r"gpu\s+\d+\s*°?\s*c", status, re.I):
+            errs.append(f"gpu shot status has no GPU temperature: {status!r}")
     defects = str(d.get("defects", "")).strip().lower()
     if defects not in ("none", "", "no defects"):
         errs.append(f"defects reported: {defects}")

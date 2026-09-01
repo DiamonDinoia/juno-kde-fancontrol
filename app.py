@@ -27,12 +27,13 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QFormLayout,
                                QSizePolicy, QSpinBox, QVBoxLayout, QWidget)
 
 from backend import ktheme
-from backend.fancore import (DEFAULT_CAP, DEFAULT_CONFIG, DEFAULT_FAN_PROFILE,
-                             DEFAULT_PLATFORM, KNOB_XFER, MAX_KNOBS,
-                             PWM_MAX, Curve,
-                             Hwmon, HwmonNotFound, discover, parse_config,
-                             parse_presets, pwm_percent, read_cap,
-                             read_sensors, service_state)
+from backend.fancore import (DEFAULT_CAP, DEFAULT_CONFIG, DEFAULT_DGPU_PCI,
+                             DEFAULT_FAN_PROFILE, DEFAULT_PLATFORM, KNOB_XFER,
+                             MAX_KNOBS, PWM_MAX, Curve,
+                             Hwmon, HwmonNotFound, discover, dgpu_present,
+                             parse_config, parse_knobs, parse_presets,
+                             pwm_percent, read_cap, read_sensors, service_state)
+from backend.sysmon import read_dgpu
 
 TEMP_LO, TEMP_HI = 20, 110        # chart x range, °C
 HANDLE_R = 9                      # drag handle radius, px
@@ -55,6 +56,10 @@ def find_helper() -> str | None:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     return None
+
+
+def curve_defaults() -> Curve:
+    return Curve(label="quiet")
 
 
 class CurveWidget(QWidget):
@@ -369,6 +374,30 @@ class MainWindow(QWidget):
         self.result = QLabel("")
         self.result.setWordWrap(True)
 
+        # The GPU fan gets its own curve where a card exists. One canvas, one
+        # curve per role; the selector swaps which one is being edited.
+        # fancontrol shares INTERVAL/AVERAGE across pwms, so the shared fields
+        # live on both Curves and are synced at apply time.
+        self.dgpu = dgpu_present(args.dgpu_pci)
+        self.curves: dict[str, Curve | None] = {"cpu": curve_defaults(),
+                                                "gpu": curve_defaults() if self.dgpu else None}
+        self.sel = "cpu"
+        if self.dgpu:
+            sel_row = QHBoxLayout()
+            sel_row.addWidget(QLabel("Editing:"))
+            self.fan_buttons: dict[str, QPushButton] = {}
+            group = QButtonGroup(self)
+            for role, text in (("cpu", "CPU fan (pwm1)"), ("gpu", "GPU fan (pwm2)")):
+                b = QPushButton(text)
+                b.setCheckable(True)
+                b.clicked.connect(lambda _c=False, r=role: self.select_fan(r))
+                group.addButton(b)
+                sel_row.addWidget(b)
+                self.fan_buttons[role] = b
+            self.fan_buttons["cpu"].setChecked(True)
+            sel_row.addStretch(1)
+            root.addLayout(sel_row)
+
         body = QHBoxLayout()
         root.addLayout(body, 1)
 
@@ -495,7 +524,9 @@ class MainWindow(QWidget):
         self.load_all()
         # debug/test entry points (used by tests/render_app.py)
         if self.args.preset in self.presets:
-            self.editor_from_curve(self.presets[self.args.preset], self.args.preset)
+            self.on_preset(self.args.preset)
+        if self.args.fan == "gpu" and self.dgpu:
+            self.select_fan("gpu")
         if self.args.auto:
             self.rb_auto.setChecked(True)
 
@@ -504,8 +535,37 @@ class MainWindow(QWidget):
     def dirty_label(self) -> str:
         return self.active_preset or "custom"
 
-    def curve_from_editor(self) -> Curve:
-        return Curve(
+    def select_fan(self, role: str) -> None:
+        """Swap which fan's curve the canvas + spins edit. The departing fan's
+        canvas state (knobs) is stowed in self.curves first; shared fields are
+        the spins', and are re-read from the arriving fan's curve."""
+        self.curves[self.sel] = self.canvas.curve
+        self.sel = role
+        for r, b in self.fan_buttons.items():
+            b.blockSignals(True)
+            b.setChecked(r == role)
+            b.blockSignals(False)
+        self.reflect()
+
+    def reflect(self) -> None:
+        c = self.curves[self.sel]
+        for key in ("mintemp", "maxtemp", "minpwm", "minstop", "minstart",
+                    "maxpwm", "interval", "average"):
+            sb = self.spin[key]
+            sb.blockSignals(True)
+            sb.setValue(getattr(c, key))
+            sb.blockSignals(False)
+        self.canvas.blockSignals(True)
+        self.canvas.set_curve(c)
+        self.canvas.blockSignals(False)
+        self.sync_knob_ui()
+
+    def curve_from_editor(self, role: str | None = None) -> Curve:
+        role = role or self.sel
+        base = self.canvas.curve if role == self.sel else self.curves[role]
+        if role != self.sel:
+            return base      # stowed fan: the spins describe the selected one
+        return replace(base,
             interval=self.spin["interval"].value(),
             mintemp=self.spin["mintemp"].value(),
             maxtemp=self.spin["maxtemp"].value(),
@@ -515,25 +575,14 @@ class MainWindow(QWidget):
             maxpwm=self.spin["maxpwm"].value(),
             average=self.spin["average"].value(),
             label=self.dirty_label,
-            ignore_cap=self.active_preset == "turbo",
-            # The canvas owns the knobs; the spin boxes have no row for them.
-            knobs=self.canvas.curve.knobs,
-        )
+            ignore_cap=self.active_preset == "turbo")
 
     def editor_from_curve(self, c: Curve, mark_preset: str | None = None) -> None:
         self.active_preset = mark_preset
-        for key in ("mintemp", "maxtemp", "minpwm", "minstop", "minstart",
-                    "maxpwm", "interval", "average"):
-            sb = self.spin[key]
-            sb.blockSignals(True)
-            sb.setValue(getattr(c, key))
-            sb.blockSignals(False)
-        self.canvas.blockSignals(True)
-        self.canvas.set_curve(c)  # editor shows raw values; the helper clamps to the cap on apply
-        self.canvas.blockSignals(False)
+        self.curves[self.sel] = c
+        self.reflect()
         for name, btn in self.preset_buttons.items():
             btn.setChecked(name == mark_preset)
-        self.sync_knob_ui()
 
     def sync_knob_ui(self) -> None:
         """Enable only the spin boxes that mean something in the current mode.
@@ -582,7 +631,11 @@ class MainWindow(QWidget):
         marked = None
         try:
             with open(self.args.config, encoding="utf-8") as f:
-                current = parse_config(f.read())
+                text = f.read()
+            current = parse_config(text)
+            if self.dgpu:
+                gk = parse_knobs(text, "pwm2")
+                self.curves["gpu"] = replace(current, knobs=gk)
             marked = current.label if current.label in self.presets and \
                 self.curve_matches_preset(current, current.label) else None
             self.editor_from_curve(current, marked)
@@ -615,9 +668,24 @@ class MainWindow(QWidget):
         pwms = "  ".join(f"pwm{i+1} {pwm_percent(v)}" for i, v in enumerate(s.pwms))
         enable = next((e for e in s.pwm_enables if e is not None), None)
         mode = {1: "manual", 2: "EC auto"}.get(enable, "n/a")
-        self.status.setText(f"CPU {temp_txt}    {fans}    {pwms}    mode {mode}")
-        live_pwm = next((v for v in s.pwms if v is not None), None)
-        self.canvas.set_live(s.cpu_temp_c, live_pwm)
+        status = f"CPU {temp_txt}    {fans}    {pwms}    mode {mode}"
+        gpu_temp = None
+        if self.dgpu:
+            # Asking a suspended card its temperature would wake it; show the
+            # state instead. The marker then sits the call out entirely.
+            d = read_dgpu(self.args.dgpu_pci, self.args.smi)
+            if d.present and d.powered and d.temp_c is not None:
+                gpu_temp = float(d.temp_c)
+                status += f"    GPU {d.temp_c:.0f} °C"
+            else:
+                status += f"    GPU {d.state}"
+        self.status.setText(status)
+        if self.sel == "gpu":
+            pwm = s.pwms[1] if len(s.pwms) > 1 else None
+            self.canvas.set_live(gpu_temp, pwm)
+        else:
+            live_pwm = next((v for v in s.pwms if v is not None), None)
+            self.canvas.set_live(s.cpu_temp_c, live_pwm)
         # If the EC took over (or fancontrol grabbed the fan) outside this app,
         # follow the mode — unless the user has unsaved edits.
         live_auto = enable == 2
@@ -659,6 +727,10 @@ class MainWindow(QWidget):
     def on_preset(self, name: str) -> None:
         p = self.presets[name]
         self.rb_manual.setChecked(True)
+        if self.dgpu:
+            # A preset is the same shape seeded on both fans; per-fan edits
+            # from there are the knob workflow.
+            self.curves["gpu"] = replace(p, knobs=())
         self.editor_from_curve(p, name)
         self._dirty = True
         self.result.setText(f"loaded preset '{name}' — Apply to activate")
@@ -722,18 +794,35 @@ class MainWindow(QWidget):
         if self.rb_auto.isChecked():
             argv = [helper, "--auto"]
         else:
-            c = self.curve_from_editor().clamped(
+            self.curves[self.sel] = self.canvas.curve
+            c = self.curve_from_editor("cpu").clamped(
                 None if self.active_preset == "turbo" else self.cap)
+            g = self.curve_from_editor("gpu") if self.dgpu else None
+            # Knob mode is per-config, not per-fan: one fan in knobs puts the
+            # whole file in knob mode, so the native side converts exactly.
+            knob_mode = bool(c.knobs) or bool(g and g.knobs)
+            if knob_mode:
+                if not c.knobs:
+                    c = replace(c, knobs=c.as_knobs())
+                if g is not None and not g.knobs:
+                    g = replace(g, knobs=g.as_knobs())
+                g = None if g is None else g.clamped(
+                    None if self.active_preset == "turbo" else self.cap)
             try:
                 c.validate()
+                if g is not None:
+                    g.validate()
             except ValueError as e:
                 QMessageBox.warning(self, "Invalid curve", str(e))
                 return
             opts = ["--ignore-cap"] if c.ignore_cap else []
-            if c.knobs:
+            if knob_mode:
                 opts += ["--knobs", " ".join(f"{t}:{pwm}" for t, pwm in c.knobs)]
-                # The positionals become the transfer calibration; the curve
-                # itself travels in --knobs. See fancore.KNOB_XFER.
+                if g is not None:
+                    opts += ["--gpu-knobs",
+                             " ".join(f"{t}:{pwm}" for t, pwm in g.knobs)]
+                # The positionals become the transfer calibration; the curves
+                # travel in --knobs/--gpu-knobs. See fancore.KNOB_XFER.
                 c = replace(c, **KNOB_XFER)
             argv = [helper] + opts + [
                 str(c.interval), str(c.mintemp), str(c.maxtemp), str(c.minstart),
@@ -806,6 +895,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--fan-profile", default=DEFAULT_FAN_PROFILE)
     ap.add_argument("--cap", default=DEFAULT_CAP)
     ap.add_argument("--systemctl", default="systemctl")
+    ap.add_argument("--dgpu-pci", default=DEFAULT_DGPU_PCI,
+                    help="dGPU sysfs dir; absent means no GPU fan tab")
+    ap.add_argument("--smi", default="nvidia-smi", help="nvidia-smi command")
+    ap.add_argument("--fan", choices=("cpu", "gpu"), default="cpu",
+                    help="fan curve shown at startup (renders)")
     ap.add_argument("--screenshot", help="render and save PNG, then exit")
     ap.add_argument("--dark", action="store_true")
     ap.add_argument("--preset", help="load this preset in the editor at startup")

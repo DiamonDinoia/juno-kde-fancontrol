@@ -38,6 +38,10 @@ check render-turbo-dark "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-tur
 check render-auto       "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-auto.png        --preset quiet --auto
 check render-knobs      "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-knobs.png \
                             --knobs "40:0 55:60 70:90 80:150 95:255"
+check render-gpu-knobs  "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-gpu-knobs.png \
+                            --dgpu --fan gpu \
+                            --knobs "40:0 55:60 70:90 80:150 95:255" \
+                            --gpu-knobs "35:0 50:70 65:130 80:200"
 check render-tray       "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray.png
 check render-tray-dark  "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-dark.png --dark
 check render-tray-off   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-off.png \
