@@ -41,8 +41,10 @@ def main() -> int:
     ap.add_argument("--battery", default="Discharging",
                     choices=("Discharging", "Charging", "Not charging"))
     ap.add_argument("--style", default="fusion")
+    ap.add_argument("--hide-charts", action="store_true",
+                    help="defect control: render the panel without either chart")
     ap.add_argument("--hide-chart", action="store_true",
-                    help="defect control: render the panel without its chart")
+                    help="legacy alias of --hide-charts (both charts go)")
     ap.add_argument("--probes", default="",
                     help="comma-separated probes to disable, e.g. 'battery,net'")
     args = ap.parse_args()
@@ -112,8 +114,9 @@ def main() -> int:
     ok = {"v": False}
 
     def shot() -> None:
-        if args.hide_chart:
-            mon.panel.chart.hide()
+        if args.hide_charts or args.hide_chart:
+            mon.panel.chart_cpu.hide()
+            mon.panel.chart_gpu.hide()
         mon.panel.adjustSize()
         mon.panel.show()
 

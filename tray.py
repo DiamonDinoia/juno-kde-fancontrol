@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """juno-fan-monitor — system tray readout for the Juno (Clevo) laptop.
 
-The icon carries the CPU temperature. Clicking it opens a panel with fan
-speeds, both GPUs, network rates, power draw and battery runtime, plus a
-rolling chart of CPU and GPU utilization.
+The icon carries the CPU temperature. Clicking it opens a panel with a CPU
+and a GPU utilization chart, two temperature gauges, the compute-GPU
+indicator, fan speeds, network rates, power draw and battery runtime.
 
 Test/debug entry points (used by tests/render_tray.py):
     --sysfs DIR --stat FILE --net FILE --net-class DIR --gt DIR --dgpu-pci DIR
@@ -44,14 +44,16 @@ RAPL_RULES = "/usr/share/juno-kde-fancontrol/rapl-readable.rules"    # shipped, 
 
 
 class Sparkline(QWidget):
-    """CPU / iGPU / dGPU utilization, 0..100 %, oldest sample on the left."""
+    """Utilization over time, 0..100 %, oldest sample on the left. `title`
+    names the chart on the panel ("CPU", "GPU") so the two are told apart."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.title = title
         self.setMinimumSize(260, 90)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.series: dict[str, deque[float]] = {}
-        self.colors: dict[str, str] = {}
+        self.colors: dict[str, QColor] = {}
 
     def add(self, name: str, color: QColor, value: float | None) -> None:
         if name not in self.series:
@@ -75,7 +77,16 @@ class Sparkline(QWidget):
         # clipped "100%" to "loo%" at this size.
         fm = QFontMetrics(small)
         gutter = fm.horizontalAdvance("100%") + 8
-        r = QRectF(gutter, 4, self.width() - gutter - 6, self.height() - 20)
+        # A 14 px strip above the plot carries the chart title.
+        r = QRectF(gutter, 18, self.width() - gutter - 6, self.height() - 34)
+        bold = QFont(small)
+        bold.setBold(True)
+        p.setFont(bold)
+        p.setPen(QPen(fg, 1))
+        p.drawText(QRectF(r.left(), 2, r.width(), 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   self.title)
+        p.setFont(small)
 
         p.setPen(QPen(grid, 1))
         for pct in (0, 50, 100):
@@ -111,11 +122,86 @@ class Sparkline(QWidget):
         p.end()
 
 
-# The probes the panel can show, in panel order. Every one is individually
-# switchable; the choice persists in QSettings (tray context menu -> Probes...).
+class TempGauge(QWidget):
+    """Mini temperature gauge: a labelled bar filling from `lo` to `hi` °C.
+
+    A suspended source paints no fill and its reason in the scheme's inactive
+    colour, which keeps "off" distinct from any real reading without inventing
+    a temperature. All colours come from the palette and ktheme at paint time.
+    """
+
+    def __init__(self, label: str, lo: float = 20.0, hi: float = 110.0,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.label, self.lo, self.hi = label, lo, hi
+        self.value: float | None = None
+        self.suspended: str | None = None     # the reason text while off
+        self.setMinimumSize(200, 26)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_value(self, temp_c: float | None) -> None:
+        self.value, self.suspended = temp_c, None
+        self.update()
+
+    def set_suspended(self, reason: str) -> None:
+        self.value, self.suspended = None, reason
+        self.update()
+
+    def _frac(self) -> float:
+        """Fill fraction of the range. A degenerate range divides by nothing:
+        the widget still paints, empty."""
+        span = self.hi - self.lo
+        if span <= 0:
+            return 0.0
+        if self.value is None:
+            return 0.0
+        return min(1.0, max(0.0, (self.value - self.lo) / span))
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 (Qt name)
+        pal = self.palette()
+        k = ktheme.colors(pal)
+        fg = pal.color(QPalette.ColorRole.WindowText)
+        edge = QColor(fg)
+        edge.setAlpha(90)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(1, 1, self.width() - 2, self.height() - 2)
+
+        p.setPen(QPen(edge, 1))
+        p.setBrush(pal.brush(QPalette.ColorRole.Base))
+        p.drawRoundedRect(r, 4, 4)
+
+        if self.suspended is None:
+            frac = self._frac()
+            if frac > 0:
+                hot = (self.value or 0) >= CPU_WARN_C
+                fill = k.negative if hot else k.focus
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(fill)
+                w = max(2.0, frac * r.width())
+                p.drawRoundedRect(QRectF(r.left() + 1, r.top() + 1,
+                                         min(w, r.width() - 2), r.height() - 2), 3, 3)
+            text_r = f"n/a" if self.value is None else f"{self.value:.0f} °C"
+            ink = fg
+        else:
+            text_r = self.suspended
+            ink = k.inactive
+
+        p.setPen(QPen(ink, 1))
+        outer = r.adjusted(8, 0, -8, 0)
+        p.drawText(outer, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   self.label)
+        p.drawText(outer, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   text_r)
+        p.end()
+
+
+# The dashboard widgets and rows the panel can show, in panel order. Every one
+# is individually switchable; the choice persists in QSettings (tray context
+# menu -> Probes...). The text rows, then the gauges, then the charts:
 PROBES: tuple[tuple[str, str], ...] = (
-    ("cpu", "CPU"),
-    ("gpu", "GPU"),
+    ("compute-gpu", "Compute GPU"),
     ("fan-cpu", "CPU fan"),
     ("fan-gpu", "GPU fan"),
     ("igpu", "iGPU"),
@@ -123,13 +209,34 @@ PROBES: tuple[tuple[str, str], ...] = (
     ("power", "POWER"),
     ("battery", "BATTERY"),
 )
+GAUGES: tuple[tuple[str, str], ...] = (
+    ("cpu", "CPU temperature gauge"),
+    ("gpu", "GPU temperature gauge"),
+)
+CHARTS: tuple[tuple[str, str], ...] = (
+    ("chart-cpu", "CPU utilization chart"),
+    ("chart-gpu", "GPU utilization chart"),
+)
 
 
 def probe_settings(args: argparse.Namespace) -> QSettings:
-    """--settings exists so tests and renders never touch the real store."""
+    """--settings exists so tests and renders never touch the real store.
+
+    Read-side legacy migration of pre-dashboard stores: the old panel had one
+    "chart" key and plain cpu/gpu text rows. A store that only has the legacy
+    keys maps "chart" onto BOTH new charts and keeps "cpu"/"gpu" addressing
+    what replaced those rows — the gauges. New-key writes always win; nothing
+    is rewritten, so the fixture-mode store (--settings) works unchanged."""
     if args.settings:
         return QSettings(args.settings, QSettings.Format.IniFormat)
     return QSettings("juno", "juno-fan-monitor")
+
+
+# New key -> legacy keys it falls back to when the store has no new-key entry.
+LEGACY_PROBES: dict[str, tuple[str, ...]] = {
+    "chart-cpu": ("chart",),
+    "chart-gpu": ("chart",),
+}
 
 
 class ProbesDialog(QDialog):
@@ -141,7 +248,7 @@ class ProbesDialog(QDialog):
         self.setWindowTitle("Probes — Juno system monitor")
         self.panel = panel
         lay = QVBoxLayout(self)
-        for key, label in (*PROBES, ("chart", "Utilization chart")):
+        for key, label in (*CHARTS, *GAUGES, *PROBES):
             cb = QCheckBox(label)
             cb.setChecked(panel.probe_on(key))
             cb.toggled.connect(lambda on, k=key: panel.set_probe(k, on))
@@ -161,8 +268,19 @@ class Panel(QWidget):
         self.settings = probe_settings(args)
 
         root = QVBoxLayout(self)
-        self.chart = Sparkline()
-        root.addWidget(self.chart)
+        self.charts: dict[str, Sparkline] = {}
+        for key, _label in CHARTS:
+            chart = Sparkline(title=key.removeprefix("chart-").upper())
+            root.addWidget(chart)
+            self.charts[key] = chart
+        self.chart_cpu = self.charts["chart-cpu"]
+        self.chart_gpu = self.charts["chart-gpu"]
+
+        self.gauges: dict[str, TempGauge] = {}
+        for key, label in GAUGES:
+            gauge = TempGauge(label.split()[0])      # "CPU" / "GPU"
+            root.addWidget(gauge)
+            self.gauges[key] = gauge
 
         self.row_widgets: dict[str, tuple[QLabel, QLabel]] = {}
         grid = QGridLayout()
@@ -180,11 +298,25 @@ class Panel(QWidget):
         self.hint = QLabel("")
         self.hint.setWordWrap(True)
         root.addWidget(self.hint)
+        # The indicator row's state colour: a ktheme role name, re-resolved on
+        # every retheme so a scheme switch moves it like everything else.
+        self._indicator_role = "inactive"
         self.apply_probe_visibility()
         self.retheme()
 
     def probe_on(self, key: str) -> bool:
-        return self.settings.value(f"probes/{key}", True, type=bool)
+        """New key when the store has it, else the legacy fallback (see
+        probe_settings), else on. `contains` first: QSettings reads an ini
+        "false" as the string 'false' unless asked for a bool, and a truthy
+        string would resurrect a switched-off probe."""
+        skey = f"probes/{key}"
+        if self.settings.contains(skey):
+            return self.settings.value(skey, True, type=bool)
+        for legacy in LEGACY_PROBES.get(key, ()):
+            lkey = f"probes/{legacy}"
+            if self.settings.contains(lkey):
+                return self.settings.value(lkey, True, type=bool)
+        return True
 
     def set_probe(self, key: str, on: bool) -> None:
         self.settings.setValue(f"probes/{key}", on)
@@ -195,20 +327,42 @@ class Panel(QWidget):
         for key, (name, value) in self.row_widgets.items():
             name.setVisible(self.probe_on(key))
             value.setVisible(self.probe_on(key))
-        self.chart.setVisible(self.probe_on("chart"))
+        for group in (self.charts, self.gauges):
+            for key, widget in group.items():
+                widget.setVisible(self.probe_on(key))
         self.adjustSize()
+
+    def set_indicator(self, text: str, role: str) -> None:
+        """The compute-GPU row. `role` names a ktheme colour: neutral while the
+        dGPU runs (it costs power), inactive while the iGPU does."""
+        self._indicator_role = role
+        self.set_row("compute-gpu", text)
+        self._style_indicator()
+
+    def _style_indicator(self) -> None:
+        k = ktheme.colors(self.palette())
+        sheet = f"color: {getattr(k, self._indicator_role).name()}"
+        label = self.row_widgets["compute-gpu"][1]
+        # Same no-recursion guard as the hint: assigning an unchanged sheet
+        # posts a PaletteChange and re-enters here forever.
+        if sheet != label.styleSheet():
+            label.setStyleSheet(sheet)
 
     def retheme(self) -> None:
         """Re-resolve the scheme colours and repaint. An inline stylesheet wins
-        over the palette, so the hint has to be re-set explicitly: a palette
-        change alone would leave it the old grey. setStyleSheet itself posts a
-        PaletteChange, so only a changed sheet is assigned -- otherwise this
-        re-enters through changeEvent forever."""
+        over the palette, so the hint and the indicator have to be re-set
+        explicitly: a palette change alone would leave them the old colour.
+        setStyleSheet itself posts a PaletteChange, so only a changed sheet is
+        assigned -- otherwise this re-enters through changeEvent forever."""
         ktheme.forget()
         sheet = f"color: {ktheme.colors(self.palette()).inactive.name()}"
         if sheet != self.hint.styleSheet():
             self.hint.setStyleSheet(sheet)
-        self.chart.update()
+        self._style_indicator()
+        for chart in self.charts.values():
+            chart.update()
+        for gauge in self.gauges.values():
+            gauge.update()
         self.update()
 
     def changeEvent(self, e) -> None:  # noqa: N802
@@ -329,17 +483,37 @@ class Monitor:
 
         self.tray.setIcon(self.paint_icon(temp_c))
         k = ktheme.colors(self.panel.palette())
-        self.panel.chart.add("CPU", getattr(k, SERIES["CPU"]), s.cpu_pct)
-        self.panel.chart.add("iGPU", getattr(k, SERIES["iGPU"]), s.igpu_pct)
+        self.panel.chart_cpu.add("CPU", getattr(k, SERIES["CPU"]), s.cpu_pct)
+        self.panel.chart_gpu.add("iGPU", getattr(k, SERIES["iGPU"]), s.igpu_pct)
         # The dGPU only joins the chart once it is awake; a suspended card has
         # no utilization to plot and must not be woken to invent one.
         if s.dgpu.powered and s.dgpu.util_pct is not None:
-            self.panel.chart.add("dGPU", getattr(k, SERIES["dGPU"]), s.dgpu.util_pct)
-        self.panel.chart.update()
+            self.panel.chart_gpu.add("dGPU", getattr(k, SERIES["dGPU"]), s.dgpu.util_pct)
+        self.panel.chart_cpu.update()
+        self.panel.chart_gpu.update()
+
+        # The gauges replace the old cpu/gpu text rows. A suspended dGPU shows
+        # its state, not a made-up temperature.
+        temp_txt = "n/a" if temp_c is None else f"{temp_c:.0f} °C"
+        self.panel.gauges["cpu"].set_value(temp_c)
+        d = s.dgpu
+        if not d.present:
+            self.panel.gauges["gpu"].set_suspended("absent")
+        elif not d.powered:
+            self.panel.gauges["gpu"].set_suspended("suspended")
+        elif d.temp_c is None:
+            self.panel.gauges["gpu"].set_value(None)   # awake, smi unreadable
+        else:
+            self.panel.gauges["gpu"].set_value(d.temp_c)
+
+        # Which GPU the compute load sits on, in a colour that names the cost:
+        # the dGPU drawing power is the noteworthy state.
+        if d.powered and d.util_pct is not None:
+            self.panel.set_indicator("dGPU (NVIDIA)", "neutral")
+        else:
+            self.panel.set_indicator("iGPU (Intel Arc)", "inactive")
 
         cpu_txt = "n/a" if s.cpu_pct is None else f"{s.cpu_pct:.0f}% busy"
-        temp_txt = "n/a" if temp_c is None else f"{temp_c:.0f} °C"
-        self.panel.set_row("cpu", f"{temp_txt}   {cpu_txt}")
         self.panel.set_row("fan-cpu", fan_rows[0])
         self.panel.set_row("fan-gpu", fan_rows[1])
 
@@ -350,7 +524,6 @@ class Monitor:
             igpu += f"   {s.igpu_mhz} / {s.igpu_max_mhz} MHz"
         self.panel.set_row("igpu", f"Intel Arc   {igpu}")
 
-        d = s.dgpu
         if not d.present:
             dgpu_txt = "absent"
         elif not d.powered:
@@ -360,7 +533,6 @@ class Monitor:
         else:
             dgpu_txt = (f"{d.temp_c} °C   {d.util_pct}% busy   {d.power_w:.1f} W"
                         f"   {d.memory_mb} MiB")
-        self.panel.set_row("gpu", f"NVIDIA   {dgpu_txt}")
 
         self.panel.set_row("net", f"down {fmt_rate(s.net_rx_bps)}   "
                                   f"up {fmt_rate(s.net_tx_bps)}"

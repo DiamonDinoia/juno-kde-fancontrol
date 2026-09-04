@@ -69,26 +69,50 @@ def test_tray_shots_get_the_tray_prompt():
 
 
 def test_tray_rubric_flags_a_missing_chart():
-    good = {"panel_visible": True, "utilization_chart": True, "chart_has_line": True,
-            "rows": {"CPU": "74 °C 44% busy", "GPU": "NVIDIA 61 °C 44% busy",
+    good = {"panel_visible": True, "utilization_charts": 2, "chart_has_line": True,
+            "temp_gauges": 2,
+            "rows": {"Compute GPU": "dGPU (NVIDIA)",
                      "CPU fan": "2560 RPM 31%", "GPU fan": "2480 RPM 31%",
                      "IGPU": "23% busy", "NET": "down 1.0 kB/s",
-                     "POWER": "32 W", "BATTERY": "77%"},
+                     "POWER": "32 W", "BATTERY": "77%",
+                     "CPU": "74 °C", "GPU": "61 °C"},
             "is_dark_theme": False, "defects": "none"}
-    assert vision_check.tray_rubric("tray", good) == []
-    assert vision_check.tray_rubric("tray", {**good, "utilization_chart": False})
-    assert vision_check.tray_rubric("tray", {**good, "rows": {}})
+    assert vision_check.tray_rubric("tray-dashboard", good) == []
+    # Chart count slipped to one — or none: both are the defect the control
+    # render and the unit tests exist to catch.
+    assert vision_check.tray_rubric("tray-dashboard", {**good, "utilization_charts": 1})
+    assert vision_check.tray_rubric("tray-dashboard", {**good, "utilization_charts": 0})
+    assert vision_check.tray_rubric("tray-dashboard", {**good, "temp_gauges": 0})
+    assert vision_check.tray_rubric("tray-dashboard", {**good, "temp_gauges": 1})
+    assert vision_check.tray_rubric("tray-dashboard", {**good, "rows": {}})
     assert vision_check.tray_rubric("tray-dark", good), "dark shot must look dark"
     assert vision_check.tray_rubric("tray-off", good), "suspended shot must say so"
-    bare_gpu = {**good["rows"], "GPU": "off — suspended"}
-    assert vision_check.tray_rubric("tray-off", {**good, "rows": bare_gpu}) == []
+    suspended = {**good["rows"], "Compute GPU": "iGPU (Intel Arc)", "GPU": "suspended"}
+    assert vision_check.tray_rubric("tray-off", {**good, "rows": suspended}) == []
+
+
+def test_tray_rubric_needs_a_temperature_somewhere():
+    """The gauges carry the °C readings; a render where none is readable is a
+    dashboard without its headline numbers."""
+    good = {"panel_visible": True, "utilization_charts": 2, "chart_has_line": True,
+            "temp_gauges": 2,
+            "rows": {"Compute GPU": "dGPU (NVIDIA)", "CPU fan": "2560 RPM 31%",
+                     "GPU fan": "2480 RPM 31%", "IGPU": "23% busy",
+                     "NET": "down 1.0 kB/s", "POWER": "32 W", "BATTERY": "77%",
+                     "CPU": "74 °C"},
+            "is_dark_theme": False, "defects": "none"}
+    assert vision_check.tray_rubric("tray-dashboard", good) == []
+    bare = {**good, "rows": {k: v for k, v in good["rows"].items() if k != "CPU"}}
+    assert vision_check.tray_rubric("tray-dashboard", bare)
 
 
 def test_tray_rubric_pins_the_customized_layout():
     """tray-min must show exactly the enabled probes: a leak of a hidden row, or
-    a missing visible one, is a defect the rubric has to name."""
-    good = {"panel_visible": True, "utilization_chart": False,
-            "rows": {"CPU": "74 °C 44% busy", "GPU": "NVIDIA 61 °C",
+    a missing visible one, is a defect the rubric has to name. The gauges stay
+    on there; the charts are off."""
+    good = {"panel_visible": True, "utilization_charts": 0, "temp_gauges": 2,
+            "rows": {"CPU": "74 °C", "GPU": "61 °C",
+                     "Compute GPU": "dGPU (NVIDIA)",
                      "CPU fan": "2560 RPM 31%", "GPU fan": "2480 RPM 31%",
                      "NET": "down 1.0 kB/s"},
             "is_dark_theme": False, "defects": "none"}
@@ -97,8 +121,10 @@ def test_tray_rubric_pins_the_customized_layout():
     assert vision_check.tray_rubric("tray-min", leaked)
     lost = {**good, "rows": {k: v for k, v in good["rows"].items() if k != "GPU fan"}}
     assert vision_check.tray_rubric("tray-min", lost)
-    charted = {**good, "utilization_chart": True}
+    charted = {**good, "utilization_charts": 2}
     assert vision_check.tray_rubric("tray-min", charted)
+    charted_one = {**good, "utilization_charts": 1}
+    assert vision_check.tray_rubric("tray-min", charted_one)
 
 
 def test_knob_rubric_needs_multiple_handles() -> None:

@@ -42,15 +42,18 @@ check render-gpu-knobs  "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-gpu
                             --dgpu --fan gpu \
                             --knobs "40:0 55:60 70:90 80:150 95:255" \
                             --gpu-knobs "35:0 50:70 65:130 80:200"
-check render-tray       "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray.png
+check render-tray-dashboard "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-dashboard.png
 check render-tray-dark  "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-dark.png --dark
 check render-tray-off   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-off.png \
                             --dgpu suspended --battery "Not charging"
+# tray-min keeps the legacy "chart" probe key in its store: this shot is where
+# the read-side migration (probes/chart -> both new charts off) is rendered.
 check render-tray-min   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/tray-min.png \
                             --probes igpu,power,battery,chart
 mkdir -p /out/control
 check render-control    "$PYTHON" "$SRC/tests/render_app.py"  --out /out/control/nochart.png --preset quiet --hide-chart
-check render-tray-ctl   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/control/tray-nochart.png --hide-chart
+# Defect control for the dashboard: both utilization charts removed.
+check render-tray-ctl   "$PYTHON" "$SRC/tests/render_tray.py" --out /out/control/tray-nocharts.png --hide-charts
 
 echo
 echo "=== summary"
