@@ -51,7 +51,8 @@ for f in /usr/lib/juno-kde-fancontrol/app.py \
          /usr/bin/fan-calibrate \
          /usr/lib/systemd/system/fancontrol.service.d/30-juno-fancontrol.conf \
          /usr/lib/systemd/system-sleep/fancontrol-resume \
-         /usr/share/juno-kde-fancontrol/rapl-readable.rules; do
+         /usr/share/juno-kde-fancontrol/rapl-readable.rules \
+         /etc/xdg/autostart/juno-fan-monitor.desktop; do
     grep -q "$f" <<< "$contents" && ok "has:$f" || bad "has:$f" "missing from package"
 done
 # world-writable files anywhere are a polkit-path-pin bypass waiting to happen
@@ -101,6 +102,7 @@ rm -rf "$LEGACY"
 SETTINGS_ENTRY=/usr/share/plasma/systemsettings/externalmodules/juno-fancontrol-settings.desktop
 for f in /usr/share/applications/juno-kde-fancontrol.desktop \
          /usr/share/applications/juno-fan-monitor.desktop \
+         /etc/xdg/autostart/juno-fan-monitor.desktop \
          "$SETTINGS_ENTRY"; do
     out=$(desktop-file-validate "$f" 2>&1)
     [[ -z "$out" ]] && ok "desktop-valid:$(basename "$f")" \
@@ -115,6 +117,10 @@ done
 sx=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' "$SETTINGS_ENTRY")
 [[ -n "$sx" && -x $(command -v "$sx" 2>/dev/null || echo /nonexistent) ]] \
     && ok settings-exec-installed || bad settings-exec-installed "Exec=$sx not executable on PATH"
+# same for the xdg autostart entry: a stale Exec name fails only at the next login
+ax=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' /etc/xdg/autostart/juno-fan-monitor.desktop)
+[[ -n "$ax" && -x $(command -v "$ax" 2>/dev/null || echo /nonexistent) ]] \
+    && ok autostart-exec-installed || bad autostart-exec-installed "Exec=$ax not executable on PATH"
 # The window icon app.py sets and the two entries' Icon= must agree, or the
 # task manager, the launcher and the settings page show three different icons.
 icons=$(grep -h '^Icon=' "$SETTINGS_ENTRY" /usr/share/applications/juno-kde-fancontrol.desktop \

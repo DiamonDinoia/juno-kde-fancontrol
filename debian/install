@@ -13,6 +13,7 @@ scripts/juno-gpu-curve usr/bin/
 scripts/juno-gpu-temp usr/bin/
 juno-kde-fancontrol.desktop usr/share/applications/
 juno-fan-monitor.desktop usr/share/applications/
+juno-fan-monitor.desktop etc/xdg/autostart/
 juno-fancontrol-settings.desktop usr/share/plasma/systemsettings/externalmodules/
 org.juno.kdefancontrol.policy usr/share/polkit-1/actions/
 systemd/30-juno-fancontrol.conf usr/lib/systemd/system/fancontrol.service.d/

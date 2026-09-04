@@ -259,6 +259,7 @@ fixture tree with no hardware at all.
 | `/usr/bin/fan-calibrate` | measures fan noise vs PWM with the mic, writes `/etc/fan-profile.maxpwm` |
 | `/usr/bin/juno-kde-fancontrol` | the curve editor |
 | `/usr/bin/juno-fan-monitor` | the tray monitor |
+| `/etc/xdg/autostart/juno-fan-monitor.desktop` | starts the tray monitor at login for every session |
 | `/usr/bin/juno-fan-curve` | `FCTEMPS` source that evaluates a knob curve, see [Knob curves](#knob-curves) |
 | `/usr/bin/juno-gpu-curve` | the same for the GPU fan (pwm2) off the dGPU temperature |
 | `/usr/bin/juno-gpu-temp` | plain dGPU millidegrees source for native configs |
@@ -297,8 +298,9 @@ sudo bash install.sh
 ```
 
 Run: `juno-kde-fancontrol`, or the "Juno Fan Control" launcher. The tray
-monitor is `juno-fan-monitor` / "Juno Fan Monitor"; add it to the Plasma
-autostart list to get it on login.
+monitor is `juno-fan-monitor` / "Juno Fan Monitor" and starts at login
+automatically; disable it under System Settings → Startup and Shutdown →
+Autostart.
 
 Total power draw while on AC needs the RAPL counter, which is root-only since
 PLATYPUS (CVE-2020-8694). The package ships the udev rule but does not enable

@@ -45,6 +45,8 @@ sed "s|@HELPER@|$HELPER|" "$SELF/org.juno.kdefancontrol.policy.in" \
     | install -D -m644 /dev/stdin /usr/share/polkit-1/actions/org.juno.kdefancontrol.policy
 install -D -m644 "$SELF/juno-kde-fancontrol.desktop" /usr/share/applications/juno-kde-fancontrol.desktop
 install -D -m644 "$SELF/juno-fan-monitor.desktop"    /usr/share/applications/juno-fan-monitor.desktop
+# Start the tray monitor at login in every xdg session.
+install -D -m644 "$SELF/juno-fan-monitor.desktop" /etc/xdg/autostart/juno-fan-monitor.desktop
 # System Settings scans this directory for external modules, so the entry
 # appears under System beside Power Management.
 install -D -m644 "$SELF/juno-fancontrol-settings.desktop" \
@@ -69,6 +71,7 @@ echo "  drop-in  $DROPIN/30-juno-fancontrol.conf"
 echo "  resume   /usr/lib/systemd/system-sleep/fancontrol-resume"
 echo "  policy   /usr/share/polkit-1/actions/org.juno.kdefancontrol.policy"
 echo "  launcher /usr/share/applications/juno-{kde-fancontrol,fan-monitor}.desktop"
+echo "  autostart /etc/xdg/autostart/juno-fan-monitor.desktop"
 echo "  settings /usr/share/plasma/systemsettings/externalmodules/juno-fancontrol-settings.desktop"
 echo
 echo "The drop-in takes effect on the next start:"

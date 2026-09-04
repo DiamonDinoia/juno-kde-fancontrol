@@ -27,6 +27,8 @@ export PYTHON=python3
 # Install from source into the container so renders reflect production
 # (helper found, Apply enabled). Runs as container root; fails loudly.
 install_out=$(bash "$SRC/install.sh" 2>&1) || { echo "install.sh failed:"; echo "$install_out"; exit 1; }
+# the /usr/local lane must also wire login autostart for the tray monitor
+check installsh-lane bash -c 'cd /tmp && bash /src/install.sh >/dev/null && test -f /etc/xdg/autostart/juno-fan-monitor.desktop && test -x /usr/local/bin/juno-fan-monitor'
 
 # The whole directory, never a list of files: a named list silently left
 # tests/test_ktheme.py out of the gate for a whole pass.
