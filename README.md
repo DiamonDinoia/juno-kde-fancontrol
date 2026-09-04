@@ -220,25 +220,36 @@ invisible to it, `sync()` included.
 ## The tray monitor
 
 `juno-fan-monitor` puts the CPU package temperature in the system tray
-(red above 85 °C) and opens this panel on click:
+(red above 85 °C) and opens this dashboard on click:
 
 ![tray](tray.png)
 
-- Rolling 90-sample chart of CPU, iGPU and dGPU utilization. The dGPU joins
-  the chart only while it is awake.
+- Two rolling 90-sample charts: CPU utilization, and GPU utilization with the
+  iGPU series always and the dGPU joining only while it is awake — a suspended
+  card is never woken to invent a number.
+- Two temperature gauges (20–110 °C bars, painted with the scheme's colours):
+  the CPU package and the dGPU. The dGPU gauge turns the inactive colour and
+  shows *suspended* while the card sleeps.
+- A **Compute GPU** row naming the card the load sits on: `dGPU (NVIDIA)` in
+  the scheme's warning colour while the dGPU is awake with a live reading,
+  otherwise `iGPU (Intel Arc)`.
 - CPU and GPU fan, one row each: RPM and PWM duty, read through the same
   `backend/fancore.py` the editor uses.
-- Every row and the chart is individually switchable (tray menu → **Probes…**),
-  and the choice persists across restarts.
+- Every widget — both charts, both gauges, every row — is individually
+  switchable (tray menu → **Probes…**), and the choice persists across
+  restarts. A pre-dashboard store migrates on read: `probes/chart` toggles
+  both charts, and the old `probes/cpu` / `probes/gpu` row keys now address
+  the gauges; nothing in the store is rewritten.
+- Live network rates: down/up throughput summed over physical interfaces
+  only — an interface is physical when `/sys/class/net/<if>/device` exists,
+  which drops `lo`, bridges, veth pairs and VPN tunnels in one rule.
+- Power draw and battery percentage/runtime stay text rows (details below).
 - iGPU busy % from i915 RC6 residency and the current/max render clock. The
   i915 PMU needs `CAP_PERFMON`, so RC6 residency is what an unprivileged
   process can read.
 - dGPU state from the PCI `power/runtime_status` node **first**; `nvidia-smi`
   runs only when the card is already awake, because querying a suspended GPU
   resumes it and costs about 10 W.
-- Network throughput summed over physical interfaces only — an interface is
-  physical when `/sys/class/net/<if>/device` exists, which drops `lo`,
-  bridges, veth pairs and VPN tunnels in one rule.
 - Battery percentage plus time to empty (or to full while charging), from
   `ENERGY_NOW/POWER_NOW` when the driver exposes them, otherwise
   `CHARGE_NOW × VOLTAGE_NOW / CURRENT_NOW`.

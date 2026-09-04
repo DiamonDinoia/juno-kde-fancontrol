@@ -42,9 +42,17 @@ laptop monitor called "Juno Fan Monitor".
 Look carefully and reply with ONLY a JSON object (no markdown fences):
 {
  "panel_visible": true/false,
- "utilization_chart": true/false,  // a chart of CPU/GPU utilization over time at the top?
- "chart_has_line": true/false,     // at least one drawn line inside that chart?
- "rows": {"LABEL": "verbatim text of that row"},  // the readout rows below the chart
+ "utilization_charts": <integer>,  // how many line charts of utilization over time?
+                                   // Canonical dashboards show exactly two, titled
+                                   // "CPU" and "GPU".
+ "chart_has_line": true/false,     // at least one drawn line inside the charts?
+ "temp_gauges": <integer>,         // how many horizontal progress-bar-like temperature
+                                   // gauges (a labelled bar filling up, showing °C or
+                                   // a state like "suspended")? Canonical: two (CPU, GPU).
+ "rows": {"LABEL": "verbatim text"},  // EVERY labelled readout: the text rows
+                                      // below the gauges (Compute GPU, CPU fan, ...)
+                                      // AND the label+value drawn on each gauge
+                                      // (e.g. "CPU": "74 °C", "GPU": "suspended").
  "is_dark_theme": true/false,
  "defects": "none" | "description" // blank areas, overlapping/cut-off text, missing widgets
 }"""
@@ -168,28 +176,38 @@ def tray_rubric(name: str, d: dict) -> list[str]:
     if not d.get("panel_visible"):
         errs.append("panel not visible")
     rows = {str(k).strip().lower(): str(v) for k, v in (d.get("rows") or {}).items()}
+    charts = d.get("utilization_charts")
+    gauges = d.get("temp_gauges")
     if name == "tray-min":
-        # The customized shot: five probes on, the rest off. A layout defect that
-        # resurrects a hidden row, or hides a visible one, must not pass.
-        # Labels are transcribed verbatim off the panel: "CPU fan", "GPU fan".
-        for want in ("cpu", "gpu", "cpu fan", "gpu fan", "net"):
+        # The customized shot: gauges plus three text rows on, the rest off.
+        # A layout defect that resurrects a hidden row, or hides a visible
+        # one, must not pass. Labels are transcribed verbatim off the panel.
+        for want in ("cpu fan", "gpu fan", "net"):
             if want not in rows:
                 errs.append(f"tray-min row '{want}' missing (saw: {sorted(rows)})")
         for gone in ("igpu", "power", "battery"):
             if gone in rows:
                 errs.append(f"tray-min should hide '{gone}', it is present")
-        if d.get("utilization_chart"):
-            errs.append("tray-min should have no chart, one is drawn")
+        if str(charts).strip() != "0":
+            errs.append(f"tray-min should have no charts, saw {charts!r}")
     else:
-        if not d.get("utilization_chart"):
-            errs.append("utilization chart missing")
+        # The canonical dashboard: two charts (CPU, GPU), two temperature
+        # gauges, and every text row.
+        if str(charts).strip() != "2":
+            errs.append(f"dashboard should show 2 utilization charts, saw {charts!r}")
         if not d.get("chart_has_line"):
-            errs.append("no line drawn in the chart")
-        for want in ("cpu", "gpu", "cpu fan", "gpu fan", "igpu", "net", "battery"):
+            errs.append("no line drawn in the charts")
+        for want in ("compute gpu", "cpu fan", "gpu fan", "igpu", "net",
+                     "power", "battery"):
             if want not in rows:
                 errs.append(f"row '{want}' missing (saw: {sorted(rows)})")
-    if not re.search(r"\d+\s*°?\s*c", rows.get("cpu", ""), re.I):
-        errs.append(f"CPU row has no temperature: {rows.get('cpu', '')!r}")
+    if not isinstance(gauges, int) or gauges < 2:
+        errs.append(f"expected 2 temperature gauges, saw {gauges!r}")
+    # A temperature has to be readable somewhere: the gauges carry it, and the
+    # model usually transcribes them among the rows.
+    blob = " ".join(f"{k} {v}" for k, v in rows.items())
+    if not re.search(r"\d+\s*°?\s*c\b", blob, re.I):
+        errs.append(f"no temperature readable anywhere: {blob!r}")
     for fan in ("cpu fan", "gpu fan"):
         if fan in rows and "rpm" not in rows[fan].lower():
             errs.append(f"{fan} row has no RPM: {rows[fan]!r}")
@@ -197,9 +215,10 @@ def tray_rubric(name: str, d: dict) -> list[str]:
         errs.append(f"NET row has no transfer rate: {rows['net']!r}")
     if name.endswith("dark") and not d.get("is_dark_theme"):
         errs.append("dark shot does not look dark")
-    if name.endswith("off") and not re.search(r"suspend|off|absent|d3",
-                                              rows.get("gpu", ""), re.I):
-        errs.append(f"suspended-dGPU shot does not say so: {rows.get('gpu', '')!r}")
+    if name.endswith("off"):
+        gpuish = f"{rows.get('compute gpu', '')} {rows.get('gpu', '')}"
+        if not re.search(r"suspend|off|absent|d3|igpu\s*\(intel", gpuish, re.I):
+            errs.append(f"suspended-dGPU shot does not say so: {gpuish!r}")
     defects = str(d.get("defects", "")).strip().lower()
     if defects not in ("none", "", "no defects"):
         errs.append(f"defects reported: {defects}")

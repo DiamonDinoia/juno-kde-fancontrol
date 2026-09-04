@@ -213,7 +213,37 @@ mutate M34-probe-toggle-not-saved tray.py \
     '/self.settings.setValue(f"probes\/{key}", on)/d'
 # A set_probe that ignores the store reads as all-on everywhere.
 mutate M35-probe-on-ignores-store tray.py \
-    's|return self.settings.value(f"probes/{key}", True, type=bool)|return True|'
+    's|if self.settings.contains(skey):|if False:|'
+
+# --- tray dashboard ---
+# The scheme-painting test paints with colours nothing else uses; a hardcoded
+# series colour leaves the scheme's neutral absent from the GPU chart.
+pymutate M40-dgpu-colour-hardcoded tray.py \
+    'self.panel.chart_gpu.add("dGPU", getattr(k, SERIES["dGPU"]), s.dgpu.util_pct)' \
+    'self.panel.chart_gpu.add("dGPU", QColor("#3daee9"), s.dgpu.util_pct)'
+# A degenerate gauge range must paint empty, not divide by zero.
+pymutate M41-gauge-divides-a-zero-span tray.py \
+    '        span = self.hi - self.lo
+        if span <= 0:
+            return 0.0
+' '        span = self.hi - self.lo
+'
+# The indicator must never advertise the dGPU while the card sleeps; the
+# assertion pairs the text with the never-called nvidia-smi log.
+pymutate M42-indicator-claims-awake-dgpu tray.py \
+    '        if d.powered and d.util_pct is not None:
+            self.panel.set_indicator("dGPU (NVIDIA)", "neutral")' \
+    '        if d.present:
+            self.panel.set_indicator("dGPU (NVIDIA)", "neutral")'
+# Two charts are the dashboard; one is half of it. The series/visibility tests
+# name it.
+pymutate M43-gpu-chart-dropped tray.py \
+    'CHARTS: tuple[tuple[str, str], ...] = (
+    ("chart-cpu", "CPU utilization chart"),
+    ("chart-gpu", "GPU utilization chart"),
+)' 'CHARTS: tuple[tuple[str, str], ...] = (
+    ("chart-cpu", "CPU utilization chart"),
+)'
 
 restore
 echo "== after restore: $(run)"
