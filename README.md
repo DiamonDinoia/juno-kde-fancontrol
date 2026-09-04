@@ -344,12 +344,12 @@ dpkg-buildpackage -us -uc -b --root-command=fakeroot   # needs dpkg-dev debhelpe
 ## Validation
 
 ```sh
-bash tests/run-container.sh        # clean debian:unstable container: 149 unit
-                                   # tests, 76 helper integration checks
+bash tests/run-container.sh        # clean debian:unstable container: 210 unit
+                                   # tests, 125 helper integration checks
                                    # (regen label contract vs the packaged
-                                   # fan-profile), 56 deb build/install/verify
-                                   # checks, 7 offscreen renders (4 GUI,
-                                   # 3 tray) plus 2 defect controls
+                                   # fan-profile), 31 deb build/install/verify
+                                   # checks, 11 offscreen renders (4 GUI,
+                                   # 7 tray) plus the defect controls
 bash tests/mutate.sh               # positive controls: breaks one thing at a
                                    # time and fails if a gate stays green
 bash tests/test_settings_entry.sh  # needs systemsettings; stages the entry in
@@ -375,15 +375,11 @@ stops matching the transcription the test evaluates. Knob mode gets the same
 treatment: `pwm_at(t) * 1000` goes through that arithmetic under the transfer
 calibration and the commanded PWM must come back bit for bit.
 
-Every gate here has been shown able to fail. Twenty-four mutations each break
-at least one named check: sixteen on the curve law and the helper (wrong knob
-slope, `FCTEMPS` without its `!`, regen clamping the calibration, each of the
-three monotonicity clamps, a hardcoded `DEVNAME`, `_validate_knobs` disabled)
-and eight on the theming (the cap line back to a hardcoded hex, the curve back
-to `QPalette.Highlight`, `Colors:Window` read instead of `Colors:View`, the
-scheme file ignored, the stale-handle guard dropped, `dark_palette` setting
-every colour group at once). The tree is verified green before and after each
-sweep.
+Every gate here has been shown able to fail. Forty-four mutations each break
+at least one named check, spread across the curve law and helper, the
+themability of the paintings, the GPU-fan wiring (a sleeping card must never
+be polled), and the tray's probe persistence. The tree is verified green
+before and after each sweep.
 
 ## Files
 

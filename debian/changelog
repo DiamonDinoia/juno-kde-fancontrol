@@ -1,3 +1,27 @@
+juno-kde-fancontrol (0.5.1+diamon1) unstable; urgency=low
+
+  * Editor: presets touch only the selected fan. Clicking Turbo on the CPU fan
+    no longer replaces the GPU fan's curve, and for fans whose native bands
+    differ the apply writes per-pwm MINTEMP..MAXPWM — fancontrol's format was
+    per-pwm all along. The editor thus offers three fan-specific states
+    (native band, per-pwm native band, knob curve) without ever flattening the
+    neighbouring fan.
+  * Tray: the popup is a dashboard — a CPU and a dGPU temperature gauge
+    (suspended cards show an inactive state, never a wakeup), two utilization
+    charts (CPU; GPU carrying iGPU always and dGPU only while awake), an
+    explicit "which GPU runs" indicator, and the existing network/battery
+    rows. All items stay switchable from the Probes dialog; legacy probe keys
+    keep working (read-side mapping).
+  * The tray starts at login: the existing launcher desktop file now also
+    lands in /etc/xdg/autostart. Tray start-up waits up to 30 s for the
+    status-notifier host to appear (an autostart race made it exit on fast
+    logins) and a QLockFile guard keeps it single-instance.
+  * "fan-profile regen" no longer collapses differing per-pwm bands to pwm1's
+    (it silently did) and "fan-calibrate --apply" routes custom labels through
+    regen instead of dying, so a re-cap preserves knob or dual-band configs.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Fri, 04 Sep 2026 16:06:00 -0400
+
 juno-kde-fancontrol (0.5.0+diamon1) unstable; urgency=low
 
   * The tray panel is customizable: every probe (CPU, GPU, the two fans, iGPU,
