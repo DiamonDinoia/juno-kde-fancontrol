@@ -15,11 +15,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, Qt, QTimer
+from PySide6.QtCore import (QEvent, QEventLoop, QLockFile, QPointF, QRectF,
+                            QSettings, QStandardPaths, Qt, QTimer)
 from PySide6.QtGui import (QAction, QColor, QFont, QFontMetrics, QIcon, QPainter,
                            QPalette, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
@@ -377,10 +379,28 @@ class Panel(QWidget):
         self.row_widgets[key][1].setText(text)
 
 
+def instance_lock_path() -> str:
+    """Per-user lock for the single-instance guard: the XDG runtime dir when
+    there is one, else /tmp disambiguated by uid."""
+    dirs = QStandardPaths.standardLocations(QStandardPaths.StandardLocation.RuntimeLocation)
+    if dirs:
+        return os.path.join(dirs[0], "juno-fan-monitor.lock")
+    return os.path.join("/tmp", f"juno-fan-monitor-{os.getuid()}.lock")
+
+
 class Monitor:
     def __init__(self, args: argparse.Namespace, app: QApplication) -> None:
         self.args = args
         self.app = app
+        # One instance per session: with the entry in the xdg autostart dir a
+        # manual launch on top of the autostarted copy would run two panels. A
+        # duplicate is not an error, so exit 0. tryLock also fails against the
+        # lock this same process already holds (tests build several Monitors);
+        # that is not a second instance.
+        self.lock = QLockFile(getattr(args, "lock", None) or instance_lock_path())
+        if not self.lock.tryLock(0) and self.lock.getLockInfo()[0] != os.getpid():
+            print("juno-fan-monitor is already running — exiting", file=sys.stderr)
+            raise SystemExit(0)
         self.sampler = Sampler(stat_path=args.stat, net_path=args.net,
                                gt_dir=args.gt, dgpu_pci=args.dgpu_pci,
                                supply_dir=args.power_supply, rapl_dir=args.rapl,
@@ -593,6 +613,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def ensure_tray(app: QApplication, timeout_s: float = 30.0, every_s: float = 1.0) -> int:
+    """0 once a status area exists, 1 if none shows up within `timeout_s`.
+
+    On autostart the monitor can win the race against the shell: Plasma needs
+    a moment to register its StatusNotifier host after login, and a process
+    that gives up immediately never comes back. Poll every `every_s`, pumping
+    events so the DBus registration actually arrives. A monitor with no
+    status area would run invisible and forever, so it still exits (non-zero)
+    rather than wait indefinitely.
+    """
+    deadline = time.monotonic() + timeout_s
+    while not QSystemTrayIcon.isSystemTrayAvailable():
+        rest_ms = int((deadline - time.monotonic()) * 1000)
+        if rest_ms <= 0:
+            print(f"no system tray available after {timeout_s:.0f} s — exiting",
+                  file=sys.stderr)
+            return 1
+        app.processEvents(QEventLoop.ProcessEventsFlag.WaitForMoreEvents,
+                          min(int(every_s * 1000), rest_ms))
+    return 0
+
+
 def main(argv: list[str]) -> int:
     from app import dark_palette
     args = parse_args(argv)
@@ -617,9 +659,7 @@ def main(argv: list[str]) -> int:
                                             app.exit(0)))
         QTimer.singleShot(args.interval * args.screenshot_samples + 500, shot)
     else:
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            # Without a status area the process would run invisible and forever.
-            print("no system tray available on this desktop", file=sys.stderr)
+        if ensure_tray(app):
             return 1
         mon.tray.show()
     return app.exec()
