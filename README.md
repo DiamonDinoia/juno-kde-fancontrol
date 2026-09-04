@@ -25,15 +25,20 @@ editor is a standalone app).
   axes cannot be read to a degree mid-drag. See [Knob curves](#knob-curves).
 - On a machine with a discrete GPU an `Editing:` selector above the chart gives
   the GPU fan (pwm2) its own curve, driven by the dGPU temperature rather than
-  the CPU package. See [The GPU fan](#the-gpu-fan).
+  the CPU package. Two differing native bands apply as fancontrol's per-pwm
+  values (`MINTEMP=hwmon7/pwm1=60 hwmon7/pwm2=40`), and `fan-profile regen`
+  preserves both across reboots and hwmon index drift. See
+  [The GPU fan](#the-gpu-fan).
 - Reachable from **System Settings → System → Fan Control** as well as from the
   launcher. See [System Settings integration](#system-settings-integration).
 - Every colour comes from the active KDE colour scheme, so a Breeze/Breeze Dark
   switch moves the charts with it. See [Theming](#theming).
 - Presets are scraped from the installed `fan-profile` at runtime (`/usr/bin`
   first, then `/usr/local/bin` for a manual install) — the
-  GUI can never drift from the CLI table (quiet/balanced/cool/turbo). Any
-  edit turns the profile into `custom`.
+  GUI can never drift from the CLI table (quiet/balanced/cool/turbo). A preset
+  seeds only the fan selected in the `Editing:` row, and the check-buttons
+  follow that selection (no check when the fan's curve matches no preset).
+  Any edit turns the profile into `custom`.
 - `Automatic (EC firmware)` hands the fans back to the EC
   (`fan-profile auto`).
 - Apply runs `pkexec /usr/sbin/juno-fancontrol-apply` (or the `/usr/local`

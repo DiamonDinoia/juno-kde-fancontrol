@@ -9,8 +9,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from backend.fancore import (COLD_DGPU_MILLIC, KNOB_XFER, MAX_KNOBS, Curve,
-                             HwmonNotFound, discover, dgpu_present,
+from backend.fancore import (COLD_DGPU_MILLIC, GPU_PWM, KNOB_XFER, MAX_KNOBS,
+                             Curve, HwmonNotFound, discover, dgpu_present,
                              gpu_temp_millic, parse_config, parse_knobs,
                              parse_presets, pwm_percent, read_cap, read_sensors,
                              render_config)
@@ -432,6 +432,67 @@ def test_dual_knob_roundtrip(tmp_path: Path) -> None:
                          gpu_helper="/usr/bin/juno-gpu-curve")
     assert parse_config(text).knobs == KNOBS            # pwm1, the parse default
     assert parse_knobs(text, "pwm2") == GPU_KNOBS
+
+
+GPU_BAND = Curve(interval=10, mintemp=40, maxtemp=70, minstart=80, minstop=60,
+                 minpwm=40, maxpwm=120, average=4, label="quiet")
+CPU_BAND = Curve(interval=10, mintemp=60, maxtemp=95, minstart=70, minstop=50,
+                 minpwm=0, maxpwm=100, average=4, label="quiet")
+
+EXPECTED_DUAL_BAND = """\
+# Managed by fan-profile (quiet) — 2026-08-31 07:35
+# Edit MIN/MAX values then run: fancontrol or fan-profile quiet
+INTERVAL=10
+DEVPATH=hwmon7=devices/platform/clevofan hwmon10=devices/platform/coretemp.0
+DEVNAME=hwmon7=V5xTNC_TND_TNE hwmon10=coretemp
+FCTEMPS=hwmon7/pwm1=hwmon10/temp1_input hwmon7/pwm2=!/usr/bin/juno-gpu-temp
+FCFANS=hwmon7/pwm1=hwmon7/fan1_input hwmon7/pwm2=hwmon7/fan2_input
+MINTEMP=hwmon7/pwm1=60 hwmon7/pwm2=40
+MAXTEMP=hwmon7/pwm1=95 hwmon7/pwm2=70
+MINSTART=hwmon7/pwm1=70 hwmon7/pwm2=80
+MINSTOP=hwmon7/pwm1=50 hwmon7/pwm2=60
+MINPWM=hwmon7/pwm1=0 hwmon7/pwm2=40
+MAXPWM=hwmon7/pwm1=100 hwmon7/pwm2=120
+AVERAGE=hwmon7/pwm1=4 hwmon7/pwm2=4
+"""
+
+
+def test_dual_band_render_byte_exact(tmp_path: Path) -> None:
+    """fancontrol's native per-pwm band: pwm2 keeps its own curve instead of a
+    shared fanout. Same emit layout as fan-profile write_curve with BAND_GPU
+    and juno-fancontrol-apply --gpu-band; tests/test_apply_helper.sh's T22
+    compares the helper against this reference."""
+    hw = discover(str(make_platform(tmp_path / "platform")))
+    got = render_config(CPU_BAND, hw, NOW, dgpu=True, gpu_curve=GPU_BAND,
+                        gpu_temp="/usr/bin/juno-gpu-temp")
+    assert got == EXPECTED_DUAL_BAND
+
+
+def test_dual_band_parse_roundtrip(tmp_path: Path) -> None:
+    hw = discover(str(make_platform(tmp_path / "platform")))
+    text = render_config(CPU_BAND, hw, NOW, dgpu=True, gpu_curve=GPU_BAND,
+                         gpu_temp="/usr/bin/juno-gpu-temp")
+    assert parse_config(text) == CPU_BAND            # pwm1, the parse default
+    back = parse_config(text, GPU_PWM)
+    for key in ("mintemp", "maxtemp", "minstart", "minstop", "minpwm", "maxpwm"):
+        assert getattr(back, key) == getattr(GPU_BAND, key), key
+    # INTERVAL/AVERAGE stay shared; a native band carries no knobs either way.
+    assert back.interval == CPU_BAND.interval and back.average == CPU_BAND.average
+    assert back.label == CPU_BAND.label and not back.knobs
+    # A shared-band config reads back identically for both pwms.
+    assert parse_config(EXPECTED_QUIET, GPU_PWM) == QUIET
+
+
+def test_identical_bands_emit_the_shared_bytes(tmp_path: Path) -> None:
+    """When both bands agree the emit must not move: the bytes stay exactly
+    what a single curve always produced, and EXPECTED_QUIET stays canonical."""
+    hw = discover(str(make_platform(tmp_path / "platform")))
+    with_band = render_config(QUIET, hw, NOW, dgpu=True, gpu_curve=QUIET,
+                              gpu_temp="/usr/bin/juno-gpu-temp")
+    without = render_config(QUIET, hw, NOW, dgpu=True,
+                            gpu_temp="/usr/bin/juno-gpu-temp")
+    assert with_band == without
+    assert render_config(QUIET, hw, NOW) == EXPECTED_QUIET
 
 
 def test_native_render_with_dgpu_switches_only_pwm2(tmp_path: Path) -> None:
