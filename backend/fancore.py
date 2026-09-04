@@ -285,22 +285,41 @@ def render_config(curve: Curve, hw: Hwmon, now: str,
     FCTEMPS at the executable curve sources, and pins the single segment to
     KNOB_XFER so fancontrol writes back the helper's reported value divided by
     1000. With `dgpu` the GPU fan is driven by the dGPU temperature instead of
-    coretemp: juno-gpu-curve in knob mode, juno-gpu-temp otherwise."""
+    coretemp: juno-gpu-curve in knob mode, juno-gpu-temp otherwise.
+
+    In native mode a non-knob `gpu_curve` may carry pwm2's band: when its
+    MINTEMP..MAXPWM band differs from pwm1's, those six keys are emitted
+    per-pwm (fancontrol's native `KEY=hwmonN/pwm1=v pwm2=v'` format) instead of
+    fanned out with one shared value. Identical bands emit exactly the bytes a
+    single curve always did."""
     c = curve
     f, t = hw.fan_hwmon, hw.temp_hwmon
-    if gpu_curve is not None and (not c.knobs or not gpu_curve.knobs):
-        raise ValueError("a GPU curve must be knobs, behind a knob CPU curve")
+    if gpu_curve is not None:
+        if not dgpu:
+            raise ValueError("a GPU curve without a dGPU would write pwm2 "
+                             "onto the CPU temperature")
+        if c.knobs and not gpu_curve.knobs:
+            raise ValueError("a GPU curve must be knobs, behind a knob CPU curve")
+        if gpu_curve.knobs and not c.knobs:
+            raise ValueError("a knob GPU curve must sit behind a knob CPU curve")
     if c.knobs and dgpu and gpu_curve is None:
         raise ValueError("a dGPU machine needs the GPU fan's own knobs: the "
                          "CPU curve would drive pwm2 off the CPU temperature")
+    # pwm2's own native band: a knob gpu_curve stays in knob mode, where the
+    # MIN/MAX keys carry KNOB_XFER for every pwm.
+    gpu_band = gpu_curve if gpu_curve is not None and not gpu_curve.knobs else None
 
     def source_for(p: str) -> str:
         if p == GPU_PWM and dgpu:
             return f"!{gpu_helper}" if c.knobs else f"!{gpu_temp}"
         return f"!{fan_curve}" if c.knobs else f"{t}/{hw.temp_input}"
 
-    def per_pwm(key: str, value: int) -> str:
-        return key + "=" + " ".join(f"{f}/{p}={value}" for p in hw.pwms)
+    def per_pwm(key: str, value: int, gpu_value: int | None = None) -> str:
+        out = []
+        for p in hw.pwms:
+            v = gpu_value if gpu_value is not None and p == GPU_PWM else value
+            out.append(f"{f}/{p}={v}")
+        return key + "=" + " ".join(out)
 
     if c.knobs:
         c = replace(c, **KNOB_XFER)
@@ -327,31 +346,38 @@ def render_config(curve: Curve, hw: Hwmon, now: str,
                        ("MINSTART", c.minstart), ("MINSTOP", c.minstop),
                        ("MINPWM", c.minpwm), ("MAXPWM", c.maxpwm),
                        ("AVERAGE", c.average)):
-        lines.append(per_pwm(key, value))
+        # INTERVAL/AVERAGE stay shared (fancontrol treats them per-config in
+        # practice); the six band keys fan out per-pwm when gpu_band differs.
+        if gpu_band is not None and key not in ("AVERAGE",):
+            lines.append(per_pwm(key, value, getattr(gpu_band, key.lower())))
+        else:
+            lines.append(per_pwm(key, value))
     return "\n".join(lines) + "\n"
 
 
 _CONFIG_KEYS = ("MINTEMP", "MAXTEMP", "MINSTART", "MINSTOP", "MINPWM", "MAXPWM", "AVERAGE")
 
 
-def parse_config(text: str) -> Curve:
-    """Read a fancontrol config back into a Curve (per-fan pwm1 values; all
-    fans share one curve on every profile this tool emits)."""
+def parse_config(text: str, pwm: str = CPU_PWM) -> Curve:
+    """Read a fancontrol config back into a Curve, from pwm1's values by
+    default; pass pwm="pwm2" for the GPU fan's band (parse_knobs' shape).
+    Configs with one shared band read back identical for either pwm."""
     interval = re.search(r"^INTERVAL=(\d+)", text, re.M)
     if not interval:
         raise ValueError("config has no INTERVAL line")
     values = {}
     for key in _CONFIG_KEYS:
-        m = re.search(rf"^{key}=\S+/pwm1=(\d+)", text, re.M)
+        # .* not \S+: pwm2's slot sits after a space on the same line.
+        m = re.search(rf"^{key}=.*{pwm}=(\d+)", text, re.M)
         if not m:
-            raise ValueError(f"config has no {key} entry for pwm1")
+            raise ValueError(f"config has no {key} entry for {pwm}")
         values[key.lower()] = int(m.group(1))
     label = "custom"
     m = re.search(r"^# Managed by fan-profile \((\w+)\)", text, re.M)
     if m:
         label = m.group(1)
     return Curve(interval=int(interval.group(1)), **values, label=label,
-                 knobs=parse_knobs(text))
+                 knobs=parse_knobs(text, pwm))
 
 
 _PRESET_RE = re.compile(

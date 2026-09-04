@@ -503,3 +503,68 @@ def test_live_marker_follows_the_selected_fan(tmp_path, qapp) -> None:
     w.select_fan("gpu")
     w.refresh_sensors()
     assert w.canvas.live_temp == pytest.approx(67.0)
+
+
+def test_preset_touches_only_the_selected_fan(tmp_path, qapp, no_modals) -> None:
+    """The reported defect: clicking a preset while editing fan A must not wipe
+    fan B's curve. GPU fan has knobs; Turbo is clicked on the CPU fan."""
+    w = _knob_window_dgpu(tmp_path, qapp)     # quiet preset loaded, cpu selected
+    w.select_fan("gpu")
+    _click(w.canvas, 70, 120)                 # GPU fan: knob curve built
+    gpu_knobs = w.canvas.curve.knobs
+    assert gpu_knobs
+    w.select_fan("cpu")
+    w.on_preset("turbo")
+    assert w.curve_from_editor("cpu").label == "turbo"
+    assert w.curve_from_editor("gpu").knobs == gpu_knobs, "preset wiped the other fan"
+    w.on_apply()
+    assert no_modals == [], no_modals
+    out = w.result.text()
+    # Knob mode carries both curves exactly: turbo's as_knobs() on pwm1 and
+    # the untouched GPU list on pwm2.
+    assert "--knobs" in out and "--gpu-knobs" in out
+    assert "40:100 80:255" in out                             # turbo, pwm1
+    assert all(f"{t}:{p}" in out for t, p in gpu_knobs)       # untouched, pwm2
+
+
+def test_apply_native_dual_band_sends_gpu_band(tmp_path, qapp, no_modals) -> None:
+    """Both fans native, bands differ: the apply argv carries --gpu-band with
+    pwm2's own band rather than flattening it onto pwm1's."""
+    w = _knob_window_dgpu(tmp_path, qapp)     # quiet on the cpu fan
+    w.select_fan("gpu")
+    w.spin["mintemp"].setValue(40)            # GPU fan starts earlier
+    w.on_apply()
+    assert no_modals == [], no_modals
+    out = w.result.text()
+    assert "--gpu-band" in out
+    assert "40 95 70 50 0 120" in out         # gpu band, quiet but mintemp=40
+    # pwm1's own band stays in the positionals, untouched by the gpu edit. The
+    # label is custom: a preset label would let boot regen replay the table and
+    # flatten the bands.
+    tail = out.split()[-9:]
+    assert tail == ["10", "60", "95", "70", "50", "0", "120", "4", "custom"], tail
+
+
+def test_apply_identical_native_bands_carry_no_gpu_band(tmp_path, qapp, no_modals) -> None:
+    w = _knob_window_dgpu(tmp_path, qapp)     # both fans on the quiet band
+    w.select_fan("gpu")
+    w.on_apply()
+    assert no_modals == [], no_modals
+    out = w.result.text()
+    assert "--gpu-band" not in out
+    assert "10 60 95 70 50 0 120" in out
+
+
+def test_preset_badge_follows_the_selected_fan(tmp_path, qapp) -> None:
+    """The check-buttons describe the fan on the canvas, not the last click."""
+    w = _knob_window_dgpu(tmp_path, qapp)     # quiet loaded on the cpu fan
+    assert w.preset_buttons["quiet"].isChecked()
+    w.select_fan("gpu")                       # gpu default curve matches quiet too
+    assert w.preset_buttons["quiet"].isChecked()
+    _click(w.canvas, 70, 120)                 # knob curve matches no preset
+    assert all(not b.isChecked() for b in w.preset_buttons.values())
+    w.select_fan("cpu")
+    assert w.preset_buttons["quiet"].isChecked()
+    w.select_fan("gpu")
+    assert all(not b.isChecked() for b in w.preset_buttons.values())
+    assert w.active_preset is None

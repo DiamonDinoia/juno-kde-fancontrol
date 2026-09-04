@@ -19,7 +19,10 @@
 # (fancore.KNOB_XFER) rather than a curve. On a machine with a dGPU --gpu-knobs
 # is mandatory in knob mode: the CPU curve would otherwise drive pwm2 off the
 # CPU temperature. Outside knob mode the dGPU machine's pwm2 follows
-# juno-gpu-temp, the plain millidegrees source.
+# juno-gpu-temp, the plain millidegrees source; --gpu-band gives that native
+# curve its own MINTEMP..MAXPWM band, emitted per-pwm (fancontrol's native
+# 'KEY=hwmonN/pwm1=v pwm2=v'' format). Knob mode carries per-fan curves already,
+# so --gpu-band and --knobs never mix.
 #
 # Test hooks (pkexec scrubs the environment, so these never leak into
 # production use): JFC_PLATFORM_DIR JFC_FANCONFIG JFC_CAP_FILE JFC_SYSTEMCTL
@@ -70,18 +73,20 @@ die() { echo "juno-fancontrol-apply: $*" >&2; exit 1; }
 
 usage() {
     echo "usage: juno-fancontrol-apply --auto" >&2
-    echo "   or: juno-fancontrol-apply [--ignore-cap] [--knobs \"T:P T:P ...\"] [--gpu-knobs \"T:P T:P ...\"] INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM AVERAGE LABEL" >&2
+    echo "   or: juno-fancontrol-apply [--ignore-cap] [--knobs \"T:P T:P ...\"] [--gpu-knobs \"T:P T:P ...\"] [--gpu-band \"MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM\"] INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM AVERAGE LABEL" >&2
     exit 64
 }
 
 IGNORE_CAP=0
 KNOBS=""
 GPU_KNOBS=""
+GPU_BAND=""
 while true; do
     case "${1:-}" in
         --ignore-cap) IGNORE_CAP=1; shift ;;
         --knobs)      KNOBS="${2:-}"; shift 2 ;;
         --gpu-knobs)  GPU_KNOBS="${2:-}"; shift 2 ;;
+        --gpu-band)   GPU_BAND="${2:-}"; shift 2 ;;
         *)            break ;;
     esac
 done
@@ -93,6 +98,10 @@ fi
 [[ $# -eq 9 ]] || usage
 INTERVAL="$1"; MINTEMP="$2"; MAXTEMP="$3"; MINSTART="$4"; MINSTOP="$5"
 MINPWM="$6"; MAXPWM="$7"; AVERAGE="$8"; LABEL="$9"
+
+if [[ -n "$GPU_BAND" && ( -n "$KNOBS" || -n "$GPU_KNOBS" ) ]]; then
+    die "--gpu-band and --knobs never mix: knob mode carries per-fan curves already"
+fi
 
 # --- validate (same rules as fancore.Curve.validate; fancontrol rejects bad configs) ---
 for v in "$INTERVAL" "$MINTEMP" "$MAXTEMP" "$MINSTART" "$MINSTOP" "$MINPWM" "$MAXPWM" "$AVERAGE"; do
@@ -106,6 +115,25 @@ done
 (( MINSTART <= 255 && MINSTOP <= 255 && MAXPWM <= 255 )) || die "pwm values must be <= 255"
 (( AVERAGE >= 1 && AVERAGE <= 16 ))   || die "AVERAGE must be 1..16"
 [[ "$LABEL" =~ ^[a-z0-9-]+$ ]]        || die "bad label '$LABEL'"
+
+# --- the GPU fan's own native band (pwm2): same rules as the main one ---
+GMINTEMP=""; GMAXTEMP=""; GMINSTART=""; GMINSTOP=""; GMINPWM=""; GMAXPWM=""
+if [[ -n "$GPU_BAND" ]]; then
+    GB=()
+    read -r -a GB <<< "$GPU_BAND"
+    [[ ${#GB[@]} -eq 6 ]] ||
+        die "--gpu-band takes exactly 6 numbers: MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM"
+    GMINTEMP="${GB[0]}"; GMAXTEMP="${GB[1]}"; GMINSTART="${GB[2]}"
+    GMINSTOP="${GB[3]}"; GMINPWM="${GB[4]}"; GMAXPWM="${GB[5]}"
+    for v in "$GMINTEMP" "$GMAXTEMP" "$GMINSTART" "$GMINSTOP" "$GMINPWM" "$GMAXPWM"; do
+        [[ "$v" =~ ^[0-9]+$ ]] || die "non-numeric --gpu-band argument '$v'"
+    done
+    (( GMINTEMP < GMAXTEMP ))           || die "--gpu-band: MINTEMP ($GMINTEMP) must be < MAXTEMP ($GMAXTEMP)"
+    (( GMINPWM <= GMINSTOP ))           || die "--gpu-band: MINPWM ($GMINPWM) must be <= MINSTOP ($GMINSTOP)"
+    (( GMINSTOP < GMAXPWM ))            || die "--gpu-band: MINSTOP ($GMINSTOP) must be < MAXPWM ($GMAXPWM)"
+    (( GMINSTART >= GMINSTOP ))         || die "--gpu-band: MINSTART ($GMINSTART) must be >= MINSTOP ($GMINSTOP)"
+    (( GMINSTART <= 255 && GMINSTOP <= 255 && GMAXPWM <= 255 )) || die "--gpu-band: pwm values must be <= 255"
+fi
 
 # --- validate the knob list(s) (same rules as fancore.Curve._validate_knobs) ---
 # This runs as root on caller-supplied argv, so it re-checks everything the GUI
@@ -196,15 +224,23 @@ if [[ "$IGNORE_CAP" != 1 && -f "$CAP_FILE" ]]; then
         echo "clamping MAXPWM $MAXPWM -> $CAP (calibrated noise cap)"
         MAXPWM="$CAP"
     fi
+    # The two native bands are independent fans; the cap clamps each one.
+    if [[ -n "$GPU_BAND" && -n "$CAP" ]] && (( GMAXPWM > CAP )); then
+        echo "clamping GPU MAXPWM $GMAXPWM -> $CAP (calibrated noise cap)"
+        GMAXPWM="$CAP"
+    fi
 fi
 
 # --- emit config, byte-identical to fancore.render_config / fan-profile write_curve ---
 case "$LABEL" in quiet|balanced|cool|turbo) HINT="$LABEL" ;; *) HINT="quiet" ;; esac
 
 join_by() { local IFS=' '; echo "$*"; }
-pair() { # pair KEY VALUE -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=VALUE ..."
-    local key="$1" val="$2" out=() pwm
-    for pwm in "${PWMS[@]}"; do out+=("$FANHW/$pwm=$val"); done
+pair() { # pair KEY VALUE [GPU_VALUE] -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=GPU_VALUE ..."
+    local key="$1" val="$2" gval="${3:-$2}" out=() pwm
+    for pwm in "${PWMS[@]}"; do
+        if [[ -n "$GPU_BAND" && "$pwm" == "pwm2" ]]; then out+=("$FANHW/$pwm=$gval")
+        else out+=("$FANHW/$pwm=$val"); fi
+    done
     echo "$key=$(join_by "${out[@]}")"
 }
 
@@ -249,12 +285,12 @@ trap 'rm -f "$TMP"' EXIT
     echo "DEVNAME=$FANHW=$FAN_DEVNAME $TEMPHW=$TEMP_DEVNAME"
     echo "FCTEMPS=$(join_by "${FCTEMPS[@]}")"
     echo "FCFANS=$(join_by "${FCFANS[@]}")"
-    pair MINTEMP "$MINTEMP"
-    pair MAXTEMP "$MAXTEMP"
-    pair MINSTART "$MINSTART"
-    pair MINSTOP "$MINSTOP"
-    pair MINPWM "$MINPWM"
-    pair MAXPWM "$MAXPWM"
+    pair MINTEMP "$MINTEMP" "$GMINTEMP"
+    pair MAXTEMP "$MAXTEMP" "$GMAXTEMP"
+    pair MINSTART "$MINSTART" "$GMINSTART"
+    pair MINSTOP "$MINSTOP" "$GMINSTOP"
+    pair MINPWM "$MINPWM" "$GMINPWM"
+    pair MAXPWM "$MAXPWM" "$GMAXPWM"
     pair AVERAGE "$AVERAGE"
 } > "$TMP"
 chmod 644 "$TMP"

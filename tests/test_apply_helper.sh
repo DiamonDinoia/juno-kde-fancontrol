@@ -556,6 +556,138 @@ grep -qx "# Knobs pwm2: 40:0 95:90" "$ROOT/etc/fancontrol" \
     && ok T21i-recap-gpu || bad T21i-recap-gpu "$(grep '^# Knobs pwm2' "$ROOT/etc/fancontrol")"
 echo 150 > "$ROOT/etc/fan-profile.maxpwm"
 
+# --- T22: the GPU fan's own native band (--gpu-band / regen per-pwm) ----------
+# reference text with a native dual band: render_config(dgpu=True, gpu_curve)
+render_band_ref() { # render_band_ref GPU_MAXPWM
+    "$PY" - "$ROOT/sys" "$SRC" "$JFC_GPU_TEMP" "$1" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[2])
+from backend.fancore import Curve, discover, render_config
+cpu = Curve(interval=10, mintemp=60, maxtemp=95, minstart=70, minstop=50,
+            minpwm=0, maxpwm=100, average=4, label="custom")
+gpu = Curve(interval=10, mintemp=40, maxtemp=70, minstart=80, minstop=60,
+            minpwm=40, maxpwm=int(sys.argv[4]), average=4, label="custom")
+sys.stdout.write(render_config(cpu, discover(sys.argv[1]), "2026-08-31 07:35",
+                               dgpu=True, gpu_curve=gpu, gpu_temp=sys.argv[3]))
+PYEOF
+}
+
+GB="40 70 80 60 40 120"   # a legal gpu band that differs from the cpu positionals
+
+# T22a: --gpu-band is validated like the main band: non-number, MAXTEMP<MINTEMP,
+# MAXPWM>255 and a wrong count all die before the config is touched.
+make_tree 2; make_dgpu; reset_state
+"$APPLY" 10 60 95 70 50 0 100 4 custom >/dev/null 2>&1   # known-good baseline
+keep=$(md5sum < "$ROOT/etc/fancontrol")
+for band in "40 x 80 60 40 120" "40 30 80 60 40 120" "40 70 80 60 40 300" "40 70 80 60 40"; do
+    out=$(NO_RESTART=1 "$APPLY" --gpu-band "$band" 10 60 95 70 50 0 100 4 custom 2>&1); rc=$?
+    [[ $rc -ne 0 ]] && ok "T22a-reject[$band]" || bad "T22a-reject[$band]" "accepted: $out"
+done
+[[ "$keep" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T22a-reject-untouched || bad T22a-reject-untouched "rewritten by a rejected apply"
+
+# T22b: --gpu-band with --knobs is refused (knob mode carries per-fan curves
+# already) — again leaving the config byte-identical.
+make_tree 2; make_dgpu; reset_state
+"$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" >/dev/null 2>&1
+keep=$(md5sum < "$ROOT/etc/fancontrol")
+out=$("$APPLY" --knobs "$KN" --gpu-band "$GB" "${XFER[@]}" 2>&1); rc=$?
+[[ $rc -ne 0 ]] && grep -q "never mix" <<< "$out" \
+    && ok T22b-mix-refused || bad T22b-mix-refused "rc=$rc $out"
+[[ "$keep" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+    && ok T22b-mix-untouched || bad T22b-mix-untouched "rewritten by a refused apply"
+
+# T22c: native dual-band emit is byte-identical to render_config(dgpu=True,
+# gpu_curve=band); equal bands fall back to the shared bytes.
+make_tree 2; make_dgpu; reset_state
+out=$(NO_RESTART=1 "$APPLY" --gpu-band "$GB" 10 60 95 70 50 0 100 4 custom 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T22c-band-apply || bad T22c-band-apply "rc=$rc $out"
+diff <(render_band_ref 120) "$ROOT/etc/fancontrol" >/dev/null \
+    && ok T22c-band-byte-exact \
+    || bad T22c-band-byte-exact "$(diff <(render_band_ref 120) "$ROOT/etc/fancontrol" | head -8)"
+NO_RESTART=1 "$APPLY" --gpu-band "60 95 70 50 0 100" 10 60 95 70 50 0 100 4 custom >/dev/null 2>&1
+grep -qx "MINTEMP=hwmon7/pwm1=60 hwmon7/pwm2=60" "$ROOT/etc/fancontrol" \
+    && ok T22c-equal-band-shared \
+    || bad T22c-equal-band-shared "$(grep '^MINTEMP=' "$ROOT/etc/fancontrol")"
+
+# T22d: boot contract: restart replays fan-profile regen, which must keep BOTH
+# bands (pwm1=60/pwm2=40 do not collapse). Line 1's date differs, compare the rest.
+make_tree 2; make_dgpu; reset_state
+out=$("$APPLY" --gpu-band "$GB" 10 60 95 70 50 0 100 4 custom 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T22d-band-restart || bad T22d-band-restart "rc=$rc $out"
+grep -qx "MINTEMP=hwmon7/pwm1=60 hwmon7/pwm2=40" "$ROOT/etc/fancontrol" \
+    && ok T22d-restart-keeps-band \
+    || bad T22d-restart-keeps-band "$(grep '^MINTEMP=' "$ROOT/etc/fancontrol")"
+if diff -q <(tail -n +2 <(render_band_ref 120)) <(tail -n +2 "$ROOT/etc/fancontrol") >/dev/null; then
+    ok T22d-regen-byte-exact
+else
+    bad T22d-regen-byte-exact "$(diff <(tail -n +2 <(render_band_ref 120)) <(tail -n +2 "$ROOT/etc/fancontrol") | head -8)"
+fi
+
+# T22e: index drift: after clevofan moves to hwmon4 the dual band is re-emitted
+# on the new index with both bands intact.
+mv "$ROOT/sys/clevofan/hwmon/hwmon7" "$ROOT/sys/clevofan/hwmon/hwmon4"
+out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T22e-drift-regen || bad T22e-drift-regen "rc=$rc $out"
+grep -qx "MINTEMP=hwmon4/pwm1=60 hwmon4/pwm2=40" "$ROOT/etc/fancontrol" \
+    && ok T22e-drift-keeps-both-bands \
+    || bad T22e-drift-keeps-both-bands "$(grep '^MINTEMP=' "$ROOT/etc/fancontrol")"
+grep -q "hwmon7" "$ROOT/etc/fancontrol" && bad T22e-stale-index "hwmon7 survived regen" || ok T22e-stale-index
+mv "$ROOT/sys/clevofan/hwmon/hwmon4" "$ROOT/sys/clevofan/hwmon7"
+
+# T22f: the cap clamps each band independently: the gpu band's MAXPWM alone
+# comes down to 150 when over, and pwm1's 100 never moves (and vice versa).
+make_tree 2; make_dgpu; reset_state
+out=$(NO_RESTART=1 "$APPLY" --gpu-band "40 70 80 60 40 200" 10 60 95 70 50 0 100 4 custom 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T22f-cap-apply || bad T22f-cap-apply "rc=$rc $out"
+grep -q "clamping GPU MAXPWM 200 -> 150" <<< "$out" \
+    && ok T22f-cap-msg || bad T22f-cap-msg "$out"
+grep -qx "MAXPWM=hwmon7/pwm1=100 hwmon7/pwm2=150" "$ROOT/etc/fancontrol" \
+    && ok T22f-cap-clamps-gpu-only \
+    || bad T22f-cap-clamps-gpu-only "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
+NO_RESTART=1 "$APPLY" --gpu-band "$GB" 10 60 95 70 50 0 200 4 custom >/dev/null 2>&1
+grep -qx "MAXPWM=hwmon7/pwm1=150 hwmon7/pwm2=120" "$ROOT/etc/fancontrol" \
+    && ok T22f-cap-clamps-cpu-only \
+    || bad T22f-cap-clamps-cpu-only "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
+
+# T22g: fan-calibrate --apply on a 'custom' label routes to regen instead of
+# dying: the on-disk curve keeps both bands and the new cap lands on each.
+mkdir -p "$ROOT/bin/fc"
+cat > "$ROOT/bin/fc/fan-profile" <<EOF
+#!/bin/bash
+exec "$ROOT/bin/fpwrap" "\$@"
+EOF
+chmod +x "$ROOT/bin/fc/fan-profile"
+make_tree 2; make_dgpu; reset_state
+NO_RESTART=1 "$APPLY" --gpu-band "$GB" 10 60 95 70 50 0 100 4 custom >/dev/null 2>&1
+out=$(env PATH="$ROOT/bin/fc:$ROOT/bin:$PATH" FC_AS_ROOT=1 FC_TEST_CAP=100 \
+         FC_CAP_FILE="$ROOT/etc/fan-profile.maxpwm" FC_FANCONFIG="$ROOT/etc/fancontrol" \
+         FC_SYSTEMCTL="$ROOT/bin/systemctl" bash "$SRC/fan-calibrate" --apply 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T22g-calibrate-custom || bad T22g-calibrate-custom "rc=$rc $out"
+grep -qx "MINTEMP=hwmon7/pwm1=60 hwmon7/pwm2=40" "$ROOT/etc/fancontrol" \
+    && ok T22g-calibrate-keeps-bands \
+    || bad T22g-calibrate-keeps-bands "$(grep '^MINTEMP=' "$ROOT/etc/fancontrol")"
+grep -qx "MAXPWM=hwmon7/pwm1=100 hwmon7/pwm2=100" "$ROOT/etc/fancontrol" \
+    && ok T22g-calibrate-recaps-both-bands \
+    || bad T22g-calibrate-recaps-both-bands "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
+[[ "$(cat "$ROOT/etc/fan-profile.maxpwm")" == "100" ]] \
+    && ok T22g-cap-written || bad T22g-cap-written "$(cat "$ROOT/etc/fan-profile.maxpwm")"
+echo 150 > "$ROOT/etc/fan-profile.maxpwm"
+
+# T22h: same routing keeps a knob config a knob config (both lines carried and
+# re-capped by regen, never replayed through the preset table).
+make_tree 2; make_dgpu; reset_state
+NO_RESTART=1 "$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" >/dev/null 2>&1
+grep -qx "# Knobs pwm1: $KN" "$ROOT/etc/fancontrol" || bad T22h-setup "knob lines missing pre-calibrate"
+out=$(env PATH="$ROOT/bin/fc:$ROOT/bin:$PATH" FC_AS_ROOT=1 FC_TEST_CAP=150 \
+         FC_CAP_FILE="$ROOT/etc/fan-profile.maxpwm" FC_FANCONFIG="$ROOT/etc/fancontrol" \
+         FC_SYSTEMCTL="$ROOT/bin/systemctl" bash "$SRC/fan-calibrate" --apply 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T22h-calibrate-knobs || bad T22h-calibrate-knobs "rc=$rc $out"
+grep -qx "# Knobs pwm1: $KN" "$ROOT/etc/fancontrol" \
+    && grep -qx "# Knobs pwm2: $GKN" "$ROOT/etc/fancontrol" \
+    && ok T22h-calibrate-keeps-knobs \
+    || bad T22h-calibrate-keeps-knobs "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+
 echo
 echo "helper tests: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

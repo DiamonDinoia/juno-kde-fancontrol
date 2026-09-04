@@ -16,6 +16,11 @@
 # Run in a QUIET room, don't type during the ~1-minute sweep. The fan WILL get
 # loud near the top — that's expected. Run as your normal user (NOT sudo) so
 # pw-record has your PipeWire session; pwm writes escalate via sudo internally.
+#
+# Test hooks (same style as fan-profile's FP_*): FC_CAP_FILE FC_FANCONFIG
+# FC_SYSTEMCTL FC_AS_ROOT skip the real /etc and sudo; FC_TEST_CAP=N skips the
+# sweep (no pipewire/hwmon needed) and goes straight to the apply path with
+# cap N.
 set -euo pipefail
 
 LEVELS=(${LEVELS:-60 90 120 150 180 210 255})
@@ -24,36 +29,15 @@ REC=${REC:-4}               # seconds of audio per level
 THRESH_DB=${THRESH_DB:-12}   # cap = loudest level within +THRESH_DB of fan floor
 MIN_RANGE_DB=${MIN_RANGE_DB:-6} # below this audio span -> fall back to RPM
 RPM_FRAC=${RPM_FRAC:-0.65}   # RPM-fallback cap target = RPM_FRAC * max RPM
-CAP_FILE=/etc/fan-profile.maxpwm
+CAP_FILE="${FC_CAP_FILE:-/etc/fan-profile.maxpwm}"
+FANCONFIG="${FC_FANCONFIG:-/etc/fancontrol}"
+SYSTEMCTL="${FC_SYSTEMCTL:-systemctl}"
 CLEVO_GLOB="/sys/devices/platform/clevofan/hwmon/hwmon*"
 APPLY=0
 [[ "${1:-}" == "--apply" ]] && APPLY=1
 
-command -v pw-record >/dev/null || { echo "need pw-record (pipewire)"; exit 1; }
-command -v pactl >/dev/null     || { echo "need pactl";              exit 1; }
-python3 -c 'import numpy' 2>/dev/null || { echo "need python3 + numpy"; exit 1; }
-
-priv() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+priv() { if [[ $EUID -eq 0 || "${FC_AS_ROOT:-0}" == "1" ]]; then "$@"; else sudo "$@"; fi; }
 setfile() { printf '%s\n' "$2" | priv tee "$1" >/dev/null; }
-
-HWMON=$(echo $CLEVO_GLOB)
-[[ -d "$HWMON" ]] || { echo "clevofan hwmon not found"; exit 1; }
-PWM1="$HWMON/pwm1"; PWM2="$HWMON/pwm2"
-EN1="$HWMON/pwm1_enable"; EN2="$HWMON/pwm2_enable"; RPM1="$HWMON/fan1_input"
-
-FANCTL_WAS=$(systemctl is-active fancontrol 2>/dev/null || true)
-MIC_VOL_ORIG=$(pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oP '\d+(?=%)' | head -1 || echo 40)
-
-restore() {
-    echo; echo "Restoring fan control and mic gain..."
-    pactl set-source-volume @DEFAULT_SOURCE@ "${MIC_VOL_ORIG}%" 2>/dev/null || true
-    if [[ "$FANCTL_WAS" == "active" ]]; then
-        priv systemctl start fancontrol.service 2>/dev/null || true
-    else
-        setfile "$EN1" 2 2>/dev/null || true; setfile "$EN2" 2 2>/dev/null || true
-    fi
-}
-trap restore EXIT INT TERM
 
 # A-weighted loudness (dB, relative) of a wav, DC removed.
 measure_db() {
@@ -74,31 +58,57 @@ except Exception: print("nan")
 PY
 }
 
-echo "fan-calibrate: sweeping PWM ${LEVELS[*]}  (settle ${SETTLE}s, record ${REC}s each)"
-echo "Stay quiet — measuring A-weighted mic loudness per level. Fan will spin up."
-echo
+# The sweep: takes manual control of the fans, records one level at a time and
+# leaves the cap in the global CAP. Restores fan control and mic gain on exit.
+sweep() {
+    command -v pw-record >/dev/null || { echo "need pw-record (pipewire)"; exit 1; }
+    command -v pactl >/dev/null     || { echo "need pactl";              exit 1; }
+    python3 -c 'import numpy' 2>/dev/null || { echo "need python3 + numpy"; exit 1; }
 
-pactl set-source-volume @DEFAULT_SOURCE@ 100% 2>/dev/null || true
-priv systemctl stop fancontrol.service 2>/dev/null || true
-setfile "$EN1" 1; setfile "$EN2" 1
+    HWMON=$(echo $CLEVO_GLOB)
+    [[ -d "$HWMON" ]] || { echo "clevofan hwmon not found"; exit 1; }
+    PWM1="$HWMON/pwm1"; PWM2="$HWMON/pwm2"
+    EN1="$HWMON/pwm1_enable"; EN2="$HWMON/pwm2_enable"; RPM1="$HWMON/fan1_input"
 
-declare -a R_LVL R_RPM R_DB
-printf "%6s  %8s  %10s\n" "PWM" "RPM" "loudnessA"
-for lvl in "${LEVELS[@]}"; do
-    setfile "$PWM1" "$lvl"; setfile "$PWM2" "$lvl"
-    sleep "$SETTLE"
-    rpm=$(cat "$RPM1" 2>/dev/null || echo 0)
-    wav=$(mktemp --suffix=.wav)
-    timeout "$REC" pw-record --channels=1 --rate=16000 "$wav" 2>/dev/null || true
-    db=$(measure_db "$wav"); rm -f "$wav"
-    R_LVL+=("$lvl"); R_RPM+=("$rpm"); R_DB+=("$db")
-    printf "%6s  %8s  %10s\n" "$lvl" "$rpm" "$db"
-done
+    FANCTL_WAS=$("$SYSTEMCTL" is-active fancontrol 2>/dev/null || true)
+    MIC_VOL_ORIG=$(pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oP '\d+(?=%)' | head -1 || echo 40)
 
-LV_CSV=$(IFS=,; echo "${R_LVL[*]}")
-RPM_CSV=$(IFS=,; echo "${R_RPM[*]}")
-DB_CSV=$(IFS=,; echo "${R_DB[*]}")
-read -r CAP METHOD <<<"$(python3 - "$THRESH_DB" "$MIN_RANGE_DB" "$RPM_FRAC" "$LV_CSV" "$RPM_CSV" "$DB_CSV" <<'PY'
+    restore() {
+        echo; echo "Restoring fan control and mic gain..."
+        pactl set-source-volume @DEFAULT_SOURCE@ "${MIC_VOL_ORIG}%" 2>/dev/null || true
+        if [[ "$FANCTL_WAS" == "active" ]]; then
+            priv "$SYSTEMCTL" start fancontrol.service 2>/dev/null || true
+        else
+            setfile "$EN1" 2 2>/dev/null || true; setfile "$EN2" 2 2>/dev/null || true
+        fi
+    }
+    trap restore EXIT INT TERM
+
+    echo "fan-calibrate: sweeping PWM ${LEVELS[*]}  (settle ${SETTLE}s, record ${REC}s each)"
+    echo "Stay quiet — measuring A-weighted mic loudness per level. Fan will spin up."
+    echo
+
+    pactl set-source-volume @DEFAULT_SOURCE@ 100% 2>/dev/null || true
+    priv "$SYSTEMCTL" stop fancontrol.service 2>/dev/null || true
+    setfile "$EN1" 1; setfile "$EN2" 1
+
+    declare -a R_LVL R_RPM R_DB
+    printf "%6s  %8s  %10s\n" "PWM" "RPM" "loudnessA"
+    for lvl in "${LEVELS[@]}"; do
+        setfile "$PWM1" "$lvl"; setfile "$PWM2" "$lvl"
+        sleep "$SETTLE"
+        rpm=$(cat "$RPM1" 2>/dev/null || echo 0)
+        wav=$(mktemp --suffix=.wav)
+        timeout "$REC" pw-record --channels=1 --rate=16000 "$wav" 2>/dev/null || true
+        db=$(measure_db "$wav"); rm -f "$wav"
+        R_LVL+=("$lvl"); R_RPM+=("$rpm"); R_DB+=("$db")
+        printf "%6s  %8s  %10s\n" "$lvl" "$rpm" "$db"
+    done
+
+    LV_CSV=$(IFS=,; echo "${R_LVL[*]}")
+    RPM_CSV=$(IFS=,; echo "${R_RPM[*]}")
+    DB_CSV=$(IFS=,; echo "${R_DB[*]}")
+    read -r CAP METHOD <<<"$(python3 - "$THRESH_DB" "$MIN_RANGE_DB" "$RPM_FRAC" "$LV_CSV" "$RPM_CSV" "$DB_CSV" <<'PY'
 import sys
 nan=float('nan')
 thr,minr,frac=float(sys.argv[1]),float(sys.argv[2]),float(sys.argv[3])
@@ -117,23 +127,40 @@ else:
 PY
 )"
 
-echo
-if [[ "$METHOD" == "audio" ]]; then
-    echo "Recommended non-turbo MAXPWM cap: $CAP  (loudest level within +${THRESH_DB} dB(A) of the quietest fan level)"
+    echo
+    if [[ "$METHOD" == "audio" ]]; then
+        echo "Recommended non-turbo MAXPWM cap: $CAP  (loudest level within +${THRESH_DB} dB(A) of the quietest fan level)"
+    else
+        echo "Mic could not separate levels (range < ${MIN_RANGE_DB} dB) — fell back to RPM."
+        echo "Recommended non-turbo MAXPWM cap: $CAP  (RPM <= ${RPM_FRAC} x max RPM)"
+    fi
+}
+
+if [[ "${FC_TEST_CAP:-}" =~ ^[0-9]+$ ]]; then
+    CAP="$FC_TEST_CAP"              # test hook: skip the sweep
 else
-    echo "Mic could not separate levels (range < ${MIN_RANGE_DB} dB) — fell back to RPM."
-    echo "Recommended non-turbo MAXPWM cap: $CAP  (RPM <= ${RPM_FRAC} x max RPM)"
+    sweep
 fi
 
 if [[ "$APPLY" == "1" ]]; then
     setfile "$CAP_FILE" "$CAP"
     echo "Wrote $CAP_FILE = $CAP"
-    cur=$(grep -m1 '^# Managed by fan-profile' /etc/fancontrol 2>/dev/null | sed 's/.*(//; s/).*//')
+    cur=$(grep -m1 '^# Managed by fan-profile' "$FANCONFIG" 2>/dev/null | sed 's/.*(//; s/).*//')
     [[ -z "$cur" || "$cur" == "turbo" ]] && cur=balanced
     echo "Re-applying current profile: $cur"
     trap - EXIT INT TERM
-    pactl set-source-volume @DEFAULT_SOURCE@ "${MIC_VOL_ORIG}%" 2>/dev/null || true
-    priv fan-profile "$cur"          # /usr/bin (package) or /usr/local/bin (legacy), both on sudo secure_path
+    pactl set-source-volume @DEFAULT_SOURCE@ "${MIC_VOL_ORIG:-40}%" 2>/dev/null || true
+    case "$cur" in
+        quiet|balanced|cool|turbo)
+            # /usr/bin (package) or /usr/local/bin (legacy), both on sudo secure_path
+            priv fan-profile "$cur" ;;
+        *)
+            # custom is not in the preset table: replaying it through the table
+            # would flatten a knob curve or a dual band. regen keeps the on-disk
+            # curve and re-caps it; the restart picks the re-capped config up.
+            priv env NO_RESTART=1 fan-profile regen
+            priv "$SYSTEMCTL" restart fancontrol.service ;;
+    esac
 else
     echo "Re-run with --apply to write the cap and re-apply your profile."
 fi

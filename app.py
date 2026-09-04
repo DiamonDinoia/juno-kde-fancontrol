@@ -28,10 +28,11 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QFormLayout,
 
 from backend import ktheme
 from backend.fancore import (DEFAULT_CAP, DEFAULT_CONFIG, DEFAULT_DGPU_PCI,
-                             DEFAULT_FAN_PROFILE, DEFAULT_PLATFORM, KNOB_XFER,
+                             DEFAULT_FAN_PROFILE, DEFAULT_PLATFORM, GPU_PWM,
+                             KNOB_XFER,
                              MAX_KNOBS, PWM_MAX, Curve,
                              Hwmon, HwmonNotFound, discover, dgpu_present,
-                             parse_config, parse_knobs, parse_presets,
+                             parse_config, parse_presets,
                              pwm_percent, read_cap, read_sensors, service_state)
 from backend.sysmon import read_dgpu
 
@@ -545,7 +546,21 @@ class MainWindow(QWidget):
             b.blockSignals(True)
             b.setChecked(r == role)
             b.blockSignals(False)
+        # The preset check-buttons describe the fan now on the canvas: recompute
+        # them from the arriving curve (none checked when it matches no preset).
+        marked = self._matching_preset(self.curves[role])
+        self.active_preset = marked
+        for name, btn in self.preset_buttons.items():
+            btn.setChecked(name == marked)
         self.reflect()
+
+    def _matching_preset(self, c: Curve) -> str | None:
+        """The preset this fan's native band matches, or None. A knob curve is
+        custom by construction even if its stale band fields match a preset."""
+        if c.knobs:
+            return None
+        return next((n for n in self.presets
+                     if self.curve_matches_preset(c, n)), None)
 
     def reflect(self) -> None:
         c = self.curves[self.sel]
@@ -634,8 +649,9 @@ class MainWindow(QWidget):
                 text = f.read()
             current = parse_config(text)
             if self.dgpu:
-                gk = parse_knobs(text, "pwm2")
-                self.curves["gpu"] = replace(current, knobs=gk)
+                # pwm2's own band (and knobs): a dual-band config must come
+                # back as the two bands on disk, not pwm1 faned out.
+                self.curves["gpu"] = parse_config(text, GPU_PWM)
             marked = current.label if current.label in self.presets and \
                 self.curve_matches_preset(current, current.label) else None
             self.editor_from_curve(current, marked)
@@ -727,10 +743,8 @@ class MainWindow(QWidget):
     def on_preset(self, name: str) -> None:
         p = self.presets[name]
         self.rb_manual.setChecked(True)
-        if self.dgpu:
-            # A preset is the same shape seeded on both fans; per-fan edits
-            # from there are the knob workflow.
-            self.curves["gpu"] = replace(p, knobs=())
+        # Only the selected fan gets the preset: seeding the other fan would
+        # silently wipe a knob curve built on it.
         self.editor_from_curve(p, name)
         self._dirty = True
         self.result.setText(f"loaded preset '{name}' — Apply to activate")
@@ -808,6 +822,9 @@ class MainWindow(QWidget):
                     g = replace(g, knobs=g.as_knobs())
                 g = None if g is None else g.clamped(
                     None if self.active_preset == "turbo" else self.cap)
+            elif g is not None:
+                # The cap applies to each band independently.
+                g = g.clamped(None if self.active_preset == "turbo" else self.cap)
             try:
                 c.validate()
                 if g is not None:
@@ -824,6 +841,17 @@ class MainWindow(QWidget):
                 # The positionals become the transfer calibration; the curves
                 # travel in --knobs/--gpu-knobs. See fancore.KNOB_XFER.
                 c = replace(c, **KNOB_XFER)
+            elif g is not None:
+                # fancontrol's per-pwm band: pwm2 keeps its own curve instead of
+                # being flattened onto pwm1's. The config is no longer the preset
+                # then — a table label would let regen replay the table at boot
+                # and flatten pwm2 back onto it.
+                band = ("mintemp", "maxtemp", "minstart", "minstop",
+                        "minpwm", "maxpwm")
+                if any(getattr(g, k) != getattr(c, k) for k in band):
+                    opts += ["--gpu-band",
+                             " ".join(str(getattr(g, k)) for k in band)]
+                    c = replace(c, label="custom")
             argv = [helper] + opts + [
                 str(c.interval), str(c.mintemp), str(c.maxtemp), str(c.minstart),
                 str(c.minstop), str(c.minpwm), str(c.maxpwm), str(c.average),

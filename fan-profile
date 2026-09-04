@@ -79,11 +79,21 @@ KNOB_HELPER=""       # pwm1's executable FCTEMPS source, read back by regen
 KNOB_GPU_HELPER=""   # pwm2's, when the config carries one
 KNOB_CPU=""          # the normalized "# Knobs pwm1: ..." line, or empty
 KNOB_GPU=""          # the "# Knobs pwm2: ..." line, or empty
+# A native dual-band config (juno-fancontrol-apply --gpu-band) carries pwm2's
+# own MINTEMP..MAXPWM. regen keeps BOTH: BAND_GPU holds pwm2's six values when
+# they differ from pwm1's, and write_curve fans the band keys out per-pwm —
+# fancontrol's native 'KEY=hwmonN/pwm1=v pwm2=v'' format. Empty means one
+# shared band, fanned out exactly as presets always were.
+BAND_GPU=""
 
-# per_pwm KEY VALUE -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=VALUE ..."
+# per_pwm KEY VALUE [GPU_VALUE] -> "KEY=hwmonX/pwm1=VALUE hwmonX/pwm2=VALUE ..."
 per_pwm() {
-    local out=() p
-    for p in "${PWMS[@]}"; do out+=("$FANHW/$p=$2"); done
+    local out=() p v
+    for p in "${PWMS[@]}"; do
+        v="$2"
+        if [[ -n "$BAND_GPU" && "$p" == "pwm2" && -n "${3:-}" ]]; then v="$3"; fi
+        out+=("$FANHW/$p=$v")
+    done
     echo "$1=${out[*]}"
 }
 
@@ -130,7 +140,11 @@ fan_header() {
 }
 
 # write_curve INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM
+# BAND_GPU, when set, fans the band keys out per-pwm (pwm2 keeps its own band;
+# AVERAGE stays shared), matching fancore.render_config's layout exactly.
 write_curve() {
+    local gv=("" "" "" "" "" "")
+    [[ -z "$BAND_GPU" ]] || read -r "gv[0]" "gv[1]" "gv[2]" "gv[3]" "gv[4]" "gv[5]" <<< "$BAND_GPU"
     {
         echo "# Managed by fan-profile ($PROFILE) — $(date '+%Y-%m-%d %H:%M')"
         # Must stay byte-identical to fancore.render_config, which writes the
@@ -141,16 +155,21 @@ write_curve() {
             echo "# Knob curve: edit the knobs in juno-kde-fancontrol. The MIN/MAX"
             echo "# values below are the fixed transfer calibration, not the curve."
         else
-            echo "# Edit MIN/MAX values then run: fancontrol or fan-profile $PROFILE"
+            # Unknown labels hint at quiet — the same mapping
+            # fancore.render_config and juno-fancontrol-apply use, so all three
+            # writers stay byte-identical on custom labels too.
+            local hint=quiet
+            case "$PROFILE" in quiet|balanced|cool|turbo) hint="$PROFILE" ;; esac
+            echo "# Edit MIN/MAX values then run: fancontrol or fan-profile $hint"
         fi
         echo "INTERVAL=$1"
         fan_header
-        per_pwm MINTEMP  "$2"
-        per_pwm MAXTEMP  "$3"
-        per_pwm MINSTART "$4"
-        per_pwm MINSTOP  "$5"
-        per_pwm MINPWM   "$6"
-        per_pwm MAXPWM   "$7"
+        per_pwm MINTEMP  "$2" "${gv[0]}"
+        per_pwm MAXTEMP  "$3" "${gv[1]}"
+        per_pwm MINSTART "$4" "${gv[2]}"
+        per_pwm MINSTOP  "$5" "${gv[3]}"
+        per_pwm MINPWM   "$6" "${gv[4]}"
+        per_pwm MAXPWM   "$7" "${gv[5]}"
         per_pwm AVERAGE  4
     } > "$FANCONFIG"
 }
@@ -167,6 +186,13 @@ apply_fancontrol() {
         local cap; cap=$(tr -dc '0-9' < "$CAP_FILE")
         if [[ -n "$cap" ]] && (( maxpwm > cap )); then
             maxpwm="$cap"
+        fi
+        # pwm2's band is its own fan: the same cap lands on its MAXPWM,
+        # independently of pwm1's.
+        if [[ -n "$cap" && -n "$BAND_GPU" ]]; then
+            local gv=("" "" "" "" "" "")
+            read -r "gv[0]" "gv[1]" "gv[2]" "gv[3]" "gv[4]" "gv[5]" <<< "$BAND_GPU"
+            (( gv[5] <= cap )) || { gv[5]="$cap"; BAND_GPU="${gv[*]}"; }
         fi
     fi
     write_curve "$1" "$2" "$3" "$4" "$5" "$6" "$maxpwm"
@@ -222,8 +248,11 @@ if [[ "$PROFILE" == "-h" || "$PROFILE" == "--help" || "$PROFILE" == "help" ]]; t
 # harness: the fpwrap fixture sets it alongside FP_SYSFS/FP_FANCONFIG).
 if [[ "$(id -u)" -ne 0 && "${FP_AS_ROOT:-0}" != "1" ]]; then exec sudo "$0" "$@"; fi
 
-# regen_value CFG KEY -> first pwm1 value of a fancontrol key line
-regen_value() { sed -n "s/^$2=\\S*=\\([0-9]\\+\\).*/\\1/p" "$1" | head -1; }
+# regen_value CFG KEY [PWM] -> that pwm's value of a fancontrol key line
+# (defaults to pwm1, the first slot). A config whose pwms carry different
+# values (a --gpu-band config) reads back per-pwm instead of collapsing pwm2
+# onto pwm1.
+regen_value() { sed -n "s/^$2=.*${3:-pwm1}=\\([0-9]\\+\\).*/\\1/p" "$1" | head -1; }
 
 # Apply the calibrated noise ceiling to a knob line. fan-calibrate --apply
 # writes a new cap and then re-applies the current profile, which for a knob
@@ -247,9 +276,11 @@ cap_knobs() {
 }
 
 # regen for a custom label (written by juno-kde-fancontrol): re-emit the
-# on-disk curve values with freshly-resolved hwmon indices, keeping the label.
+# on-disk curve values with freshly-resolved hwmon indices, keeping the label
+# and, on a dual-band config, BOTH bands.
 regen_custom() {
     local interval mintemp maxtemp minstart minstop minpwm maxpwm average v
+    local gmintemp gmaxtemp gminstart gminstop gminpwm gmaxpwm
     # A legacy untagged '# Knobs:' line drove both fans off the CPU temperature;
     # normalize it to the pwm1 tag here so the rewrite is the canonical form.
     KNOB_CPU=$(sed -n 's/^# Knobs \(pwm1: \)\?/# Knobs pwm1: /p' "$FANCONFIG" | head -1)
@@ -285,6 +316,26 @@ regen_custom() {
             exit 0
         fi
     done
+    # pwm2's own band: same per-key parse, then BAND_GPU carries it only where
+    # it differs, so a single shared band re-emits exactly as before.
+    BAND_GPU=""
+    gmintemp=$(regen_value "$FANCONFIG" MINTEMP pwm2)
+    gmaxtemp=$(regen_value "$FANCONFIG" MAXTEMP pwm2)
+    gminstart=$(regen_value "$FANCONFIG" MINSTART pwm2)
+    gminstop=$(regen_value "$FANCONFIG" MINSTOP pwm2)
+    gminpwm=$(regen_value "$FANCONFIG" MINPWM pwm2)
+    gmaxpwm=$(regen_value "$FANCONFIG" MAXPWM pwm2)
+    if grep -q '/pwm2=' "$FANCONFIG"; then
+        for v in "$gmintemp" "$gmaxtemp" "$gminstart" "$gminstop" "$gminpwm" "$gmaxpwm"; do
+            if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+                echo "fan-profile regen: cannot parse values in $FANCONFIG, left untouched" >&2
+                exit 0
+            fi
+        done
+        [[ "$gmintemp $gmaxtemp $gminstart $gminstop $gminpwm $gmaxpwm" != \
+           "$mintemp $maxtemp $minstart $minstop $minpwm $maxpwm" ]] &&
+            BAND_GPU="$gmintemp $gmaxtemp $gminstart $gminstop $gminpwm $gmaxpwm"
+    fi
     apply_fancontrol "$interval" "$mintemp" "$maxtemp" "$minstart" "$minstop" "$minpwm" "$maxpwm"
     # write_curve hardcodes AVERAGE=4; restore a custom value (per-pwm
     # replacement — a greedy match would only rewrite the last entry).

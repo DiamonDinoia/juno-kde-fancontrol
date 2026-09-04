@@ -76,10 +76,14 @@ def main() -> int:
                               average=curve.average, label="custom", knobs=gk)
             gpu_curve.validate()
         elif args.dgpu:
-            # A dGPU render in knob mode cannot name no GPU curve (render_ref
-            # refuses the asymmetry); mirror the editor's seeding instead.
+            # A dGPU render in knob mode cannot name no GPU curve (render_config
+            # refuses the asymmetry). The editor seeds presets per fan now, so
+            # the untouched gpu side ships as the native preset's exact
+            # as_knobs() conversion, as on_apply does.
+            native = parse_presets(FIXTURE_FP.read_text())[args.preset]
             gpu_curve = Curve(interval=curve.interval, minstart=curve.minstart,
-                              average=curve.average, label="custom", knobs=knobs)
+                              average=curve.average, label="custom",
+                              knobs=native.as_knobs())
     hw = discover(str(platform))
     config = etc / "fancontrol"
     config.write_text(render_config(curve.clamped(None if curve.ignore_cap else 150),

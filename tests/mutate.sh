@@ -31,7 +31,7 @@ exec 9>"$LOCK" || exit 1
 flock -n 9 || { echo "another sweep holds $LOCK -- refusing to run"; exit 1; }
 BK=$(mktemp -d)
 OUT=$(mktemp -d)
-FILES=(backend/fancore.py backend/ktheme.py backend/sysmon.py juno-fancontrol-apply fan-profile app.py fancurve.py tray.py)
+FILES=(backend/fancore.py backend/ktheme.py backend/sysmon.py juno-fancontrol-apply fan-profile fan-calibrate app.py fancurve.py tray.py)
 save()    { for f in "${FILES[@]}"; do mkdir -p "$BK/$(dirname "$f")"; cp "$f" "$BK/$f"; done; }
 restore() { find . -name __pycache__ -type d -prune -exec rm -rf {} + ; for f in "${FILES[@]}"; do cp "$BK/$f" "$f"; done; }
 trap 'restore; rm -rf "$BK" "$OUT"; echo "[trap] tree restored"' EXIT
@@ -244,6 +244,30 @@ pymutate M43-gpu-chart-dropped tray.py \
 )' 'CHARTS: tuple[tuple[str, str], ...] = (
     ("chart-cpu", "CPU utilization chart"),
 )'
+
+# --- per-fan independence (SP2) ---
+# regen collapsing pwm2's band onto pwm1's is the silent flattening T22 guards.
+mutate M36-regen-collapses-pwm2 fan-profile \
+    's|BAND_GPU="$gmintemp $gmaxtemp $gminstart $gminstop $gminpwm $gmaxpwm"|BAND_GPU=""|'
+# A preset click that re-seeds the other fan wipes its knob curve again.
+pymutate M37-preset-reseeds-other-fan app.py \
+    '        # Only the selected fan gets the preset: seeding the other fan would
+        # silently wipe a knob curve built on it.
+        self.editor_from_curve(p, name)' \
+    '        self.curves["gpu"] = replace(p, knobs=())
+        self.editor_from_curve(p, name)'
+# Emitting the shared fanout even when the bands differ silently writes a
+# single-band config for a dual-band request.
+pymutate M38-render-collapses-gpu-band backend/fancore.py \
+    '        if gpu_band is not None and key not in ("AVERAGE",):
+            lines.append(per_pwm(key, value, getattr(gpu_band, key.lower())))
+        else:
+            lines.append(per_pwm(key, value))' \
+    '        lines.append(per_pwm(key, value))'
+# Routing a custom label through the preset table is fan-calibrate's pre-fix
+# behaviour; it exits 1 and leaves the cap written but the curve in place.
+mutate M39-calibrate-custom-dies fan-calibrate \
+    's|priv env NO_RESTART=1 fan-profile regen|priv fan-profile "$cur"|'
 
 restore
 echo "== after restore: $(run)"
