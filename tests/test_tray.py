@@ -47,7 +47,10 @@ def _mon(tmp_path, qapp, *, n_fans: int = 2, hw: bool = True, probes_off=(),
         net_class=str(root / "net_class"), gt=str(root / "gt0"),
         dgpu_pci=str(root / "dgpu"), power_supply=str(root / "power_supply"),
         rapl=str(root / "rapl"), nvidia_smi=str(smi), settings=str(settings),
-        interval=10 ** 9, screenshot=None, screenshot_samples=0, dark=False)
+        interval=10 ** 9, screenshot=None, screenshot_samples=0, dark=False,
+        # Default per-user lock would fight production trays and dead lock
+        # files (a stale lock with a recycled pid is indistinguishable alive).
+        lock=str(tmp_path / "juno-fan-monitor.lock"))
     return traymod.Monitor(ns, qapp), settings, root, smi_log_path
 
 

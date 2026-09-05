@@ -282,12 +282,33 @@ fixture tree with no hardware at all.
 | `/usr/sbin/juno-fancontrol-apply` | root helper behind pkexec |
 | `…/fancontrol.service.d/30-juno-fancontrol.conf` | `Restart=always` + the boot-time `fan-profile regen` |
 | `/usr/lib/systemd/system-sleep/fancontrol-resume` | re-attach the curve after resume |
-| `…/plasma/systemsettings/externalmodules/juno-fancontrol-settings.desktop` | the System Settings entry, see [above](#system-settings-integration) |
+| `…/plasma/systemsettings/externalmodules/juno-fancontrol-settings.desktop` | the System Settings entry, see [above](#systemsettings-integration) |
 | `/usr/share/juno-kde-fancontrol/rapl-readable.rules` | optional udev rule, not active until installed |
+| `…/qt6/plugins/ksystemstats/ksystemstats_plugin_juno.so` | registers the laptop's sensors with `ksystemstats` so any System Monitor widget can show them |
 
 The drop-in is named `30-` so it sorts after the hand-installed `10-restart.conf`
 and `20-resync.conf` that predate this package. Its `ExecStartPre=` reset then
 wins, and the two older files become inert rather than needing deletion.
+
+## Panel widgets (System Monitor sensors)
+
+The tray popup is one click away; a permanent readout belongs on the panel.
+For that the package ships a `ksystemstats` plugin that registers this
+laptop's sensors — CPU package temperature and usage, both fans' RPM and PWM
+duty, iGPU usage and render clock, dGPU temperature/usage/memory/power-state,
+network rates, system power draw, battery charge and time-to-empty — under the
+`juno-laptop` provider. Right-click the panel → *Add or Manage Widgets* →
+System Monitor and pick what to show (gauges, bars, sparklines; every widget
+variant the stock applets offer works — the plugin only feeds them data).
+
+The plugin keeps the package's standing rule for the discrete card: a
+runtime-suspended dGPU reports its power *state* and is never asked for a
+temperature (`nvidia-smi` would wake it, costing ~10 W). No card → no dGPU
+sensors at all; the iGPU-only state reports "GPU In Use: iGPU", awake card → "dGPU".
+
+Deploy note: the package is `amd64` since 0.6.0 (the plugin is compiled);
+earlier releases were `_all`. The `install.sh` source install skips the
+plugin — sensors come from the deb only.
 
 ## Requirements
 
@@ -391,6 +412,7 @@ before and after each sweep.
 | `rapl-readable.rules` | opt-in udev rule for the root-only RAPL energy counter |
 | `app.py` | PySide6 GUI (chart, editor, live sensors, pkexec apply) |
 | `tray.py` | PySide6 tray monitor (temps, fans, GPUs, network, power, battery) |
+| `ksystemstats/` | C++ `ksystemstats` plugin: registers the laptop's sensors for System Monitor widgets |
 | `fancurve.py` | the `juno-fan-curve` body: reads the knobs from `/etc/fancontrol`, prints the pre-distorted temperature |
 | `backend/ktheme.py` | KColorScheme roles read out of `kdeglobals`, with Breeze as the fallback |
 | `juno-fancontrol-settings.desktop` | System Settings external module entry |

@@ -3,10 +3,18 @@
 %:
 	dh $@
 
-override_dh_install:
+# The payload is Python except the ksystemstats plugin, which CMake builds in
+# its own directory; dh's auto sequences stay off for the top tree.
+override_dh_auto_configure:
+	dh_auto_configure --sourcedirectory=ksystemstats -- -DCMAKE_INSTALL_PREFIX=/usr
+
+override_dh_auto_build:
+	dh_auto_build --sourcedirectory=ksystemstats
 	sed 's|@HELPER@|/usr/sbin/juno-fancontrol-apply|' org.juno.kdefancontrol.policy.in \
 	    > org.juno.kdefancontrol.policy
-	dh_install
+
+override_dh_auto_install:
+	dh_auto_install --sourcedirectory=ksystemstats
 
 override_dh_clean:
 	dh_clean

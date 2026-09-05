@@ -51,13 +51,14 @@ def make_dgpu(root, *, awake: bool = True, temp_c: int = 55) -> Path:
 
 
 def write_fake_nvidia_smi(path: Path, log: Path, *, temp_c: int = 55,
-                          fail: bool = False) -> Path:
+                          util_pct: int = 0, power_w: float = 0.0,
+                          memory_mb: int = 0, fail: bool = False) -> Path:
     # The log proves the never-wake rule: a suspended-GPU run must leave it empty.
     script = (
         "#!/bin/bash\n"
         f'echo "$*" >> "{log}"\n'
         + ("exit 1\n" if fail else
-           f'echo "{temp_c}, 0, 0.0, 0"\n'))  # temp,util,power,mem — csv,noheader
+           f'echo "{temp_c}, {util_pct}, {power_w}, {memory_mb}"\n'))
     path.write_text(script)
     path.chmod(0o755)
     return path

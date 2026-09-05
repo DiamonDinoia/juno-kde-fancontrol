@@ -35,6 +35,7 @@ check installsh-lane bash -c 'cd /tmp && bash /src/install.sh >/dev/null && test
 check fancore-unit      "$PYTHON" -m pytest -q -p no:cacheprovider "$SRC/tests"
 check apply-helper      env PYTHON="$PYTHON" bash "$SRC/tests/test_apply_helper.sh"
 check deb-package       bash "$SRC/tests/test_deb.sh"
+check ksystemstats      bash "$SRC/tests/test_ksystemstats.sh"
 check render-quiet      "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-quiet.png       --preset quiet
 check render-turbo-dark "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-turbo-dark.png  --preset turbo --dark
 check render-auto       "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-auto.png        --preset quiet --auto

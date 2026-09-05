@@ -11,7 +11,13 @@ ok()   { PASS=$((PASS+1)); echo "PASS $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "FAIL $1: $2"; }
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get install -y -qq --no-install-recommends dpkg-dev debhelper fakeroot build-essential >/dev/null 2>&1
+# Build-Depends of debian/control, kept explicit because the build happens
+# inside this gate's container rather than via dpkg-buildpackage -d.
+# dpkg-checkbuilddeps names any miss loudly; this list cannot drift silently.
+apt-get install -y -qq --no-install-recommends dpkg-dev debhelper fakeroot build-essential \
+    cmake extra-cmake-modules qt6-base-dev libkf6coreaddons-dev libkf6i18n-dev \
+    libksysguard-dev libsensors-dev >/tmp/apt.deb.log 2>&1 \
+    || { echo "apt install failed:"; tail -5 /tmp/apt.deb.log; exit 1; }
 
 # --- build (in a scratch copy: a build must not dirty the source mount) ------
 mkdir -p "$DIST"
@@ -25,8 +31,13 @@ else
     echo "deb tests: $PASS passed, $FAIL failed (build failed — skipping rest)"
     exit 1
 fi
-DEB=$(ls "$BUILD"/juno-kde-fancontrol_*_all.deb 2>/dev/null | head -1)
+DEB=$(ls "$BUILD"/juno-kde-fancontrol_*_amd64.deb 2>/dev/null | head -1)
 [[ -n "$DEB" ]] && cp "$DEB" "$DIST/" && ok deb-artifact || bad deb-artifact "no .deb produced"
+# The plugin is a compiled object, so _amd64 changed flavor; guard against the
+# package silently reverting to _all.
+ls "$BUILD"/juno-kde-fancontrol_*_all.deb >/dev/null 2>&1 \
+    && bad deb-arch "an _all deb slipped through — the plugin would be missing" \
+    || ok deb-arch
 
 # --- inspect -------------------------------------------------------------------
 contents=$(dpkg-deb -c "$DEB")
@@ -52,7 +63,8 @@ for f in /usr/lib/juno-kde-fancontrol/app.py \
          /usr/lib/systemd/system/fancontrol.service.d/30-juno-fancontrol.conf \
          /usr/lib/systemd/system-sleep/fancontrol-resume \
          /usr/share/juno-kde-fancontrol/rapl-readable.rules \
-         /etc/xdg/autostart/juno-fan-monitor.desktop; do
+         /etc/xdg/autostart/juno-fan-monitor.desktop \
+         /usr/lib/x86_64-linux-gnu/qt6/plugins/ksystemstats/ksystemstats_plugin_juno.so; do
     grep -q "$f" <<< "$contents" && ok "has:$f" || bad "has:$f" "missing from package"
 done
 # world-writable files anywhere are a polkit-path-pin bypass waiting to happen
@@ -60,6 +72,9 @@ ww=$(awk '$1 ~ /^-/ && substr($1,9,1)=="w"' <<< "$contents")
 [[ -z "$ww" ]] && ok no-world-writable || bad no-world-writable "$ww"
 dpkg-deb -f "$DEB" Depends | grep -q python3-pyside6.qtwidgets && ok dep-pyside6 || bad dep-pyside6 "$(dpkg-deb -f "$DEB" Depends)"
 dpkg-deb -f "$DEB" Depends | grep -q fancontrol    && ok dep-fancontrol || bad dep-fancontrol ""
+dpkg-deb -f "$DEB" Depends | grep -q ksystemstats  && ok dep-ksystemstats || bad dep-ksystemstats "$(dpkg-deb -f "$DEB" Depends)"
+dpkg-deb -f "$DEB" Depends | grep -q libksysguardsystemstats2 && ok dep-shlibs-resolved \
+    || bad dep-shlibs-resolved "shlibdeps did not pick up the plugin's lib"
 
 # --- install + verify (real apt resolution on Debian unstable) -------------------
 # --no-install-recommends: the Recommends are fan-calibrate's audio stack,

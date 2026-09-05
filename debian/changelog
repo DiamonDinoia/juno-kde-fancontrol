@@ -1,3 +1,20 @@
+juno-kde-fancontrol (0.6.0+diamon1) unstable; urgency=low
+
+  * Ships a ksystemstats sensor plugin: juno-laptop (CPU temperature, usage,
+    both fans' RPM and duty, iGPU usage and render clock, dGPU
+    temperature/usage/memory/power, download/upload rates, system power draw,
+    battery charge and time) appears to every System Monitor widget — add
+    one to the panel and pick. State that must not exist never does: a
+    runtime-suspended dGPU reports its power state, never a temperature, and
+    nvidia-smi is never called against it (gate-proven by an empty call log).
+  * The package is now amd64 (the plugin is compiled). The Python stack is
+    unchanged; Architecture: any and ${shlibs:Depends} resolve the plugin's
+    runtime libraries automatically.
+  * The source install (install.sh) does not build the C++ plugin; the
+    sensors require the deb.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Fri, 04 Sep 2026 22:30:00 -0400
+
 juno-kde-fancontrol (0.5.1+diamon1) unstable; urgency=low
 
   * Editor: presets touch only the selected fan. Clicking Turbo on the CPU fan

@@ -1,7 +1,14 @@
 Source: juno-kde-fancontrol
 Section: utils
 Priority: optional
-Build-Depends: debhelper-compat (= 13)
+Build-Depends: debhelper-compat (= 13),
+	cmake,
+	extra-cmake-modules,
+	qt6-base-dev,
+	libkf6coreaddons-dev,
+	libkf6i18n-dev,
+	libksysguard-dev,
+	libsensors-dev,
 Maintainer: Marco Barbone <mbarbone@flatironinstitute.org>
 Standards-Version: 4.6.2
 Homepage: https://github.com/DiamonDinoia/juno-kde-fancontrol
@@ -9,11 +16,15 @@ Homepage: https://github.com/DiamonDinoia/juno-kde-fancontrol
 Package: juno-kde-fancontrol
 Section: utils
 Priority: optional
-Architecture: all
-Depends: ${misc:Depends},
+# The ksystemstats plugin is a compiled shared object, so the package stopped
+# being architecture-independent. The apt repo matches on the new _amd64.deb
+# asset name.
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends},
 	python3-pyside6.qtwidgets (>= 6.4),
 	fancontrol,
 	pkexec,
+	ksystemstats,
 Recommends: pipewire-bin,
 	pulseaudio-utils,
 	python3-numpy,
