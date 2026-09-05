@@ -3,8 +3,10 @@
 
 #include "junoplugin.h"
 
+#include <QDateTime>
 #include <QDebug>
 #include <QDir>
+#include <QFile>
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QProcess>
@@ -268,6 +270,15 @@ JunoSensorsPrivate::JunoSensorsPrivate(JunoSensorsPlugin *qq)
 
 void JunoSensorsPrivate::update()
 {
+    // Debug-only heartbeat proving the daemon ticks this plugin (tests).
+    if (!qEnvironmentVariableIsEmpty("JUNO_KSS_DEBUG_TICKS")) {
+        QFile f(QString::fromLocal8Bit(qgetenv("JUNO_KSS_DEBUG_TICKS")));
+        if (f.open(QIODevice::Append | QIODevice::Text)) {
+            f.write(QDateTime::currentDateTime().toString(Qt::ISODate).toLocal8Bit() + " " +
+                    (dgpuObject ? QByteArray("obj") : QByteArray("noobj")) + " " +
+                    readFile(dgpuPci + QStringLiteral("/power/runtime_status")).toLocal8Bit() + "\n");
+        }
+    }
     bool ok = false;
 
     // CPU
@@ -434,6 +445,8 @@ void JunoSensorsPrivate::update()
 JunoSensorsPlugin::JunoSensorsPlugin(QObject *parent, const QVariantList &args)
     : SensorPlugin(parent, args)
 {
+    // i18nc inside ksystemstats logs "Domain is not set" otherwise, every tick.
+    KLocalizedString::setApplicationDomain("ksystemstats_juno");
     d = std::make_unique<JunoSensorsPrivate>(this);
 }
 

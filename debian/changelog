@@ -1,3 +1,11 @@
+juno-kde-fancontrol (0.6.1+diamon1) unstable; urgency=low
+
+  * Set the i18n application domain in the ksystemstats plugin: without it the
+    daemon's journal got two "Domain is not set" warnings per backend tick for
+    as long as a widget subscribed (log spam every 500 ms).
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Sat, 05 Sep 2026 05:20:00 -0400
+
 juno-kde-fancontrol (0.6.0+diamon1) unstable; urgency=low
 
   * Ships a ksystemstats sensor plugin: juno-laptop (CPU temperature, usage,
