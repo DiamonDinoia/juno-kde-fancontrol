@@ -295,10 +295,12 @@ out=$("$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
 grep -qx "MAXPWM=hwmon7/pwm1=255 hwmon7/pwm2=255" "$ROOT/etc/fancontrol" \
     && ok T14-knob-xfer-survived-regen \
     || bad T14-knob-xfer-survived-regen "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
-before=$(md5sum < "$ROOT/etc/fancontrol")
+before=$(tail -n +2 "$ROOT/etc/fancontrol" | md5sum)
 out=$("$ROOT/bin/fpwrap" regen 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok T14-knob-regen-ok || bad T14-knob-regen-ok "rc=$rc $out"
-[[ "$before" == "$(md5sum < "$ROOT/etc/fancontrol")" ]] \
+# Byte-skip line 1: regen's date stamp is its working audit trail, and a test
+# crossing a minute boundary would otherwise double as a wall-clock flake.
+[[ "$before" == "$(tail -n +2 "$ROOT/etc/fancontrol" | md5sum)" ]] \
     && ok T14-knob-regen-idempotent \
     || bad T14-knob-regen-idempotent "$(diff <(render_knob_ref "$KN") "$ROOT/etc/fancontrol" | head -6)"
 

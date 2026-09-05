@@ -1,3 +1,17 @@
+juno-kde-fancontrol (0.6.2+diamon1) unstable; urgency=low
+
+  * Start fancontrol earlier in the boot: the drop-in now waits only for
+    systemd-modules-load (clevofan binds there) and goes Before=basic.target,
+    dropping the fancontrol takeover from ~3.4 s to ~1.5 s into userspace. The
+    EC otherwise holds its loud default curve for that window — the boot blast
+    is mostly firmware POST and cannot be removed, but the userspace tail of
+    it no longer waits for the lm-sensors chain.
+  * The helper suite's regen-idempotence check no longer flakes across minute
+    boundaries; the date stamp was an audit line, not a curve key, and is now
+    excluded from the byte comparison that gates its meaning.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Sat, 05 Sep 2026 14:25:00 -0400
+
 juno-kde-fancontrol (0.6.1+diamon1) unstable; urgency=low
 
   * Set the i18n application domain in the ksystemstats plugin: without it the
