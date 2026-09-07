@@ -16,6 +16,9 @@ FANCONFIG="${FP_FANCONFIG:-/etc/fancontrol}"
 CAP_FILE="${FP_CAP_FILE:-/etc/fan-profile.maxpwm}"
 SYSFS="${FP_SYSFS:-/sys/devices/platform}"
 CLEVO_GLOB="$SYSFS/clevofan/hwmon/hwmon*"
+# FP_NOW (tests) pins the timestamp write_curve stamps into line 1, so two
+# applies inside one wall-clock minute can be exercised deterministically.
+NOW="${FP_NOW:-$(date '+%Y-%m-%d %H:%M')}"
 
 # hwmon indices are NOT stable across reboots, and fancontrol matches devices
 # by the literal hwmonN index (ValidateDevices, not by name). So resolve the
@@ -139,14 +142,15 @@ fan_header() {
     echo "FCFANS=${fans[*]}"
 }
 
-# write_curve INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM
+# write_curve OUT INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM
 # BAND_GPU, when set, fans the band keys out per-pwm (pwm2 keeps its own band;
 # AVERAGE stays shared), matching fancore.render_config's layout exactly.
 write_curve() {
+    local out="$1"; shift
     local gv=("" "" "" "" "" "")
     [[ -z "$BAND_GPU" ]] || read -r "gv[0]" "gv[1]" "gv[2]" "gv[3]" "gv[4]" "gv[5]" <<< "$BAND_GPU"
     {
-        echo "# Managed by fan-profile ($PROFILE) — $(date '+%Y-%m-%d %H:%M')"
+        echo "# Managed by fan-profile ($PROFILE) — $NOW"
         # Must stay byte-identical to fancore.render_config, which writes the
         # same file from the GUI. tests/test_fancore.py compares the two.
         if [[ -n "$KNOB_CPU" ]]; then
@@ -171,7 +175,15 @@ write_curve() {
         per_pwm MINPWM   "$6" "${gv[4]}"
         per_pwm MAXPWM   "$7" "${gv[5]}"
         per_pwm AVERAGE  4
-    } > "$FANCONFIG"
+    } > "$out"
+}
+
+# cfg_eq NEW OLD — byte compare minus line 1's ` — TIMESTAMP` tail. The stamp
+# is minute-grain wall clock, not curve content; without the exclusion every
+# re-apply a minute later differs and would restart the daemon for nothing.
+cfg_eq() {
+    [[ -f "$2" ]] || return 1
+    cmp -s <(sed '1s/ — .*//' "$1") <(sed '1s/ — .*//' "$2")
 }
 
 # apply_fancontrol INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM [clamp]
@@ -195,14 +207,27 @@ apply_fancontrol() {
             (( gv[5] <= cap )) || { gv[5]="$cap"; BAND_GPU="${gv[*]}"; }
         fi
     fi
-    write_curve "$1" "$2" "$3" "$4" "$5" "$6" "$maxpwm"
     # regen (boot ExecStartPre) only rewrites the file; touching systemctl here
     # would recurse into the unit that is currently starting us.
-    if [[ "${NO_RESTART:-0}" != "1" ]]; then
-        systemctl disable --now clevofan-auto.service 2>/dev/null || true
-        systemctl enable fancontrol.service >/dev/null 2>&1 || true
-        systemctl restart fancontrol.service
+    if [[ "${NO_RESTART:-0}" == "1" ]]; then
+        write_curve "$FANCONFIG" "$1" "$2" "$3" "$4" "$5" "$6" "$maxpwm"
+        return
     fi
+    systemctl disable --now clevofan-auto.service 2>/dev/null || true
+    systemctl enable fancontrol.service >/dev/null 2>&1 || true
+    # Every fancontrol start blips 255 onto each pwm (its pwmenable path), so a
+    # restart whose curve bytes did not change is a full-speed burst for
+    # nothing. Daemon down: start it, the compare is moot (restart starts an
+    # inactive unit).
+    local tmp="$FANCONFIG.tmp.$$"
+    write_curve "$tmp" "$1" "$2" "$3" "$4" "$5" "$6" "$maxpwm"
+    if systemctl is-active --quiet fancontrol.service && cfg_eq "$tmp" "$FANCONFIG"; then
+        rm -f "$tmp"
+        echo "fan-profile: $FANCONFIG unchanged; fancontrol.service already running — restart skipped"
+        return
+    fi
+    mv "$tmp" "$FANCONFIG"
+    systemctl restart fancontrol.service
 }
 
 apply_auto() {

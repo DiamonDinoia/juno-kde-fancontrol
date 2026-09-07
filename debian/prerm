@@ -1,0 +1,26 @@
+#!/bin/bash
+set -e
+
+# Hand the fancontrol deb's resume hook back: remove our no-op and restore
+# the diverted original. Only when the diversion is ours — never touch
+# someone else's.
+if [ "$1" = remove ]; then
+    SLP=/usr/lib/systemd/system-sleep/fancontrol
+    SLP_DIV=/usr/lib/systemd/system-sleep/.fancontrol.juno-diverted
+    if [ "$(dpkg-divert --listpackage "$SLP" 2>/dev/null || true)" = "juno-kde-fancontrol" ]; then
+        rm -f "$SLP"
+        # set -e must not abort a package removal over a half-state (e.g. the
+        # diverted file went missing): warn and drop the diversion entry only.
+        if ! dpkg-divert --package juno-kde-fancontrol --remove --rename \
+                --divert "$SLP_DIV" "$SLP"; then
+            echo "juno-kde-fancontrol: WARNING: could not restore $SLP_DIV; dropping the diversion entry anyway" >&2
+            dpkg-divert --package juno-kde-fancontrol --remove \
+                --divert "$SLP_DIV" "$SLP" \
+                || echo "juno-kde-fancontrol: WARNING: could not drop the diversion of $SLP either" >&2
+        fi
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

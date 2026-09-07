@@ -61,7 +61,7 @@ for f in /usr/lib/juno-kde-fancontrol/app.py \
          /usr/bin/fan-profile \
          /usr/bin/fan-calibrate \
          /usr/lib/systemd/system/fancontrol.service.d/30-juno-fancontrol.conf \
-         /usr/lib/systemd/system-sleep/fancontrol-resume \
+         /usr/share/juno-kde-fancontrol/fancontrol-sleep-noop \
          /usr/share/juno-kde-fancontrol/rapl-readable.rules \
          /etc/xdg/autostart/juno-fan-monitor.desktop \
          /usr/lib/x86_64-linux-gnu/qt6/plugins/ksystemstats/ksystemstats_plugin_juno.so; do
@@ -84,6 +84,14 @@ if apt-get install -y -qq --no-install-recommends "$DEB" > /tmp/deb-install.log 
 else
     bad deb-install "$(tail -8 /tmp/deb-install.log)"
 fi
+# the /usr/local lane left its drop-in under /etc: postinst must name it — a
+# drop-in there entirely shadows the deb's /usr/lib drop-ins, so the Restart
+# policy and ExecStartPre chain this package ships would never take effect
+postinst_out=$(bash /var/lib/dpkg/info/juno-kde-fancontrol.postinst configure 2>&1)
+grep -q "/etc/systemd/system/fancontrol.service.d/30-juno-fancontrol.conf" <<< "$postinst_out" \
+    && ok postinst-warns-etc-dropin || bad postinst-warns-etc-dropin "$postinst_out"
+# stash it: the quiet branches below must see the plain deb-only state
+mv /etc/systemd/system/fancontrol.service.d /tmp/etc-dropins
 # postinst branches: quiet with no legacy /usr/local copy (the container
 # case), and a shadowing note when a DIFFERENT one is there.
 postinst_out=$(bash /var/lib/dpkg/info/juno-kde-fancontrol.postinst configure 2>&1)
@@ -154,9 +162,59 @@ else
 fi
 [[ -x /usr/bin/fan-profile && -x /usr/bin/fan-calibrate ]] \
     && ok fan-cli-exec || bad fan-cli-exec "$(stat -c '%n %a' /usr/bin/fan-profile /usr/bin/fan-calibrate)"
-[[ -x /usr/lib/systemd/system-sleep/fancontrol-resume ]] \
-    && ok resume-hook-exec || bad resume-hook-exec "$(stat -c %a /usr/lib/systemd/system-sleep/fancontrol-resume)"
+# the package's own resume hook is gone: clevofan's PM notifier re-asserts the
+# manual duty after S3/S4, so a resume restart only bought each pwm a 255 blip
+[[ ! -e /usr/lib/systemd/system-sleep/fancontrol-resume ]] \
+    && ok resume-hook-gone || bad resume-hook-gone "still installed"
+grep -q "system-sleep/fancontrol-resume" <<< "$contents" \
+    && bad resume-hook-not-shipped "still in the deb" || ok resume-hook-not-shipped
+# the fancontrol deb's own resume hook is diverted over the shipped no-op
+HOOK=/usr/lib/systemd/system-sleep/fancontrol
+[[ "$(dpkg-divert --listpackage "$HOOK" 2>/dev/null)" == juno-kde-fancontrol ]] \
+    && ok hook-diverted || bad hook-diverted "$(dpkg-divert --listpackage "$HOOK" 2>&1)"
+cmp -s "$HOOK" /usr/share/juno-kde-fancontrol/fancontrol-sleep-noop \
+    && ok hook-is-noop || bad hook-is-noop "$(cat "$HOOK")"
+# postinst re-runs are idempotent: diversion kept, no-op re-asserted, no output
+rerun_out=$(bash /var/lib/dpkg/info/juno-kde-fancontrol.postinst configure 2>&1)
+[[ -z "$rerun_out" ]] && ok postinst-rerun-quiet || bad postinst-rerun-quiet "$rerun_out"
+cmp -s "$HOOK" /usr/share/juno-kde-fancontrol/fancontrol-sleep-noop \
+    && ok hook-idempotent || bad hook-idempotent "$(cat "$HOOK")"
+[[ "$(dpkg-divert --listpackage "$HOOK" 2>/dev/null)" == juno-kde-fancontrol ]] \
+    && ok hook-still-diverted || bad hook-still-diverted "diversion lost on re-run"
+# prerm hands the hook back on remove (static check; removal runs nowhere here)
+grep -q "dpkg-divert --package juno-kde-fancontrol --remove" \
+    /var/lib/dpkg/info/juno-kde-fancontrol.prerm \
+    && ok prerm-undiverts || bad prerm-undiverts "$(cat /var/lib/dpkg/info/juno-kde-fancontrol.prerm 2>/dev/null)"
+# the divert target must be outside systemd-sleep's scan: it executes every
+# non-hidden executable in system-sleep/ (skipping only dot-names, *~ and a
+# fixed suffix list), so a visible target would run BOTH hooks on every resume.
+# Asserted against both maintainer scripts and the on-disk result.
+for m in /var/lib/dpkg/info/juno-kde-fancontrol.postinst /var/lib/dpkg/info/juno-kde-fancontrol.prerm; do
+    grep -q 'system-sleep/\.fancontrol\.juno-diverted' "$m" \
+        && ! grep -q 'system-sleep/fancontrol\.juno-diverted' "$m" \
+        && ok "divert-target-hidden:$(basename "$m" | sed 's/.*\.//')" \
+        || bad "divert-target-hidden:$(basename "$m" | sed 's/.*\.//')" "visible divert target in $m"
+done
+[[ -f /usr/lib/systemd/system-sleep/.fancontrol.juno-diverted ]] \
+    && ok divert-target-on-disk \
+    || bad divert-target-on-disk "$(ls -a /usr/lib/systemd/system-sleep/)"
+[[ ! -e /usr/lib/systemd/system-sleep/fancontrol.juno-diverted ]] \
+    && ok divert-target-not-visible \
+    || bad divert-target-not-visible "visible diverted copy: both resume hooks would run"
+# last postinst assertion done: put the /usr/local lane's /etc drop-in back
+mv /tmp/etc-dropins /etc/systemd/system/fancontrol.service.d
 DROPIN=/usr/lib/systemd/system/fancontrol.service.d/30-juno-fancontrol.conf
+# every fancontrol start blips 255 onto each pwm, so the unit must not loop on
+# Restart=always; on-failure plus a StartLimit pair caps a crash loop at three
+# blips per 180 s
+grep -qx 'Restart=on-failure' "$DROPIN" && ok dropin-restart-on-failure \
+    || bad dropin-restart-on-failure "$(grep 'Restart=' "$DROPIN")"
+grep -q '^Restart=always' "$DROPIN" \
+    && bad dropin-no-restart-always "$(grep 'Restart=' "$DROPIN")" || ok dropin-no-restart-always
+grep -qx 'StartLimitIntervalSec=180' "$DROPIN" && ok dropin-startlimit-interval \
+    || bad dropin-startlimit-interval "$(cat "$DROPIN")"
+grep -qx 'StartLimitBurst=3' "$DROPIN" && ok dropin-startlimit-burst \
+    || bad dropin-startlimit-burst "$(cat "$DROPIN")"
 # the ExecStartPre must name a path the package really ships, or the boot-time
 # hwmon resync silently never runs
 regen=$(sed -n 's/^ExecStartPre=\(.*\) regen$/\1/p' "$DROPIN")

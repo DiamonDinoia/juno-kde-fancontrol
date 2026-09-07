@@ -71,6 +71,15 @@ MAX_KNOBS=16   # keep in step with fancore.MAX_KNOBS
 
 die() { echo "juno-fancontrol-apply: $*" >&2; exit 1; }
 
+# cfg_eq NEW OLD — byte compare minus line 1's ` — TIMESTAMP` tail. The stamp
+# is minute-grain wall clock (JFC_NOW pins it in tests), not curve content;
+# without the exclusion every re-apply a minute later differs and would
+# restart the daemon — and every fancontrol start blips 255 onto each pwm.
+cfg_eq() {
+    [[ -f "$2" ]] || return 1
+    cmp -s <(sed '1s/ — .*//' "$1") <(sed '1s/ — .*//' "$2")
+}
+
 usage() {
     echo "usage: juno-fancontrol-apply --auto" >&2
     echo "   or: juno-fancontrol-apply [--ignore-cap] [--knobs \"T:P T:P ...\"] [--gpu-knobs \"T:P T:P ...\"] [--gpu-band \"MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM\"] INTERVAL MINTEMP MAXTEMP MINSTART MINSTOP MINPWM MAXPWM AVERAGE LABEL" >&2
@@ -295,10 +304,6 @@ trap 'rm -f "$TMP"' EXIT
 } > "$TMP"
 chmod 644 "$TMP"
 
-[[ -f "$FANCONFIG" ]] && cp -f "$FANCONFIG" "${FANCONFIG}.bak"
-mv "$TMP" "$FANCONFIG"
-trap - EXIT
-
 restore() {
     [[ -f "${FANCONFIG}.bak" ]] && mv -f "${FANCONFIG}.bak" "$FANCONFIG"
     # Rollback is only complete once the old daemon is back up; `stop` already
@@ -309,6 +314,24 @@ restore() {
     fi
     die "$1 (config restored on disk, but fancontrol is DOWN — check: systemctl status fancontrol)"
 }
+
+# A restart with unchanged curve bytes is a 255 blip for nothing: skip it when
+# the daemon is already running. Daemon down: fall through and (re)start it,
+# the compare is moot — `restart` starts an inactive unit.
+if [[ "${NO_RESTART:-0}" != "1" ]]; then
+    "$SYSTEMCTL" disable --now clevofan-auto.service >/dev/null 2>&1 || true
+    "$SYSTEMCTL" enable fancontrol.service >/dev/null 2>&1 || true
+    if "$SYSTEMCTL" is-active --quiet fancontrol.service && cfg_eq "$TMP" "$FANCONFIG"; then
+        rm -f "$TMP"
+        trap - EXIT
+        echo "$FANCONFIG unchanged ($LABEL); fancontrol.service already running — restart skipped"
+        exit 0
+    fi
+fi
+
+[[ -f "$FANCONFIG" ]] && cp -f "$FANCONFIG" "${FANCONFIG}.bak"
+mv "$TMP" "$FANCONFIG"
+trap - EXIT
 
 "$FANCONTROL" --check "$FANCONFIG" >/dev/null 2>&1 \
     || restore "fancontrol --check rejected the new config"
@@ -322,8 +345,6 @@ fi
 
 # --- (re)start the daemon (NO_RESTART: fan-profile regen semantics) ---
 if [[ "${NO_RESTART:-0}" != "1" ]]; then
-    "$SYSTEMCTL" disable --now clevofan-auto.service >/dev/null 2>&1 || true
-    "$SYSTEMCTL" enable fancontrol.service >/dev/null 2>&1 || true
     # `|| restore`, not bare: under set -e a failing restart would otherwise
     # kill the script before the rollback could run.
     if ! "$SYSTEMCTL" restart fancontrol.service; then

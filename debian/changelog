@@ -1,3 +1,37 @@
+juno-kde-fancontrol (0.6.3+diamon1) unstable; urgency=low
+
+  * Kill the routine full-speed bursts. fancontrol writes 255 to every pwm at
+    every start (its pwmenable path), so each routine restart was a ~1 s
+    100 % fan blast. Routine operation no longer restarts the daemon at all;
+    the remaining 255 windows are the firmware POST curve and the single
+    first start at boot.
+  * Drop systemd/fancontrol-resume and dpkg-divert the fancontrol deb's own
+    /usr/lib/systemd/system-sleep/fancontrol over a shipped no-op: clevofan's
+    PM notifier re-asserts the cached manual duty on
+    PM_POST_SUSPEND/PM_POST_HIBERNATION/PM_POST_RESTORE and pwmN_enable
+    survives S3/S4, so a resume restart only bought each pwm a 255 blip. The
+    original is diverted to the dot-prefixed name
+    /usr/lib/systemd/system-sleep/.fancontrol.juno-diverted — systemd-sleep
+    executes every non-hidden executable in that dir, so a visible divert
+    target would keep running both hooks on resume. The diversion is
+    registered idempotently and removed in prerm (a half-state warns and
+    still lets the package come off); postinst warns and re-diverts if it is
+    ever found lost.
+  * Drop-in: Restart=always -> Restart=on-failure plus
+    StartLimitIntervalSec=180/StartLimitBurst=3, so a crash loop blasts at
+    most three times per 180 s instead of once every RestartSec forever.
+  * fan-profile, juno-fancontrol-apply and fan-calibrate restart the daemon
+    only when the effective config changed (line 1's minute-grain timestamp
+    excluded) or the daemon is down. New test seams FP_NOW (fan-profile) next
+    to the existing JFC_NOW pin the stamp so same-minute applies are
+    exercised deterministically; the helper suite's T23 block counts
+    restarts through the systemctl stub log.
+  * postinst warns (naming the files) when any
+    /etc/systemd/system/fancontrol.service.d/*.conf exists — those entirely
+    shadow the packaged drop-ins.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Mon, 07 Sep 2026 12:00:00 -0400
+
 juno-kde-fancontrol (0.6.2+diamon1) unstable; urgency=low
 
   * Start fancontrol earlier in the boot: the drop-in now waits only for

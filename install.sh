@@ -23,8 +23,10 @@ install -m755 "$SELF/fan-calibrate" /usr/local/bin/fan-calibrate
 sed 's|/usr/bin/fan-profile|/usr/local/bin/fan-profile|' \
     "$SELF/systemd/30-juno-fancontrol.conf" \
     | install -D -m644 /dev/stdin "$DROPIN/30-juno-fancontrol.conf"
-install -D -m755 "$SELF/systemd/fancontrol-resume" \
-    /usr/lib/systemd/system-sleep/fancontrol-resume
+# No resume hook here or in the deb: clevofan's PM notifier re-asserts the
+# manual duty after S3/S4, so restarting fancontrol on resume only blips 255.
+# (The deb additionally dpkg-diverts the fancontrol package's own hook over
+# systemd/fancontrol-sleep-noop; a source install leaves that hook alone.)
 install -D -m644 "$SELF/rapl-readable.rules" \
     /usr/local/share/juno-kde-fancontrol/rapl-readable.rules
 
@@ -68,7 +70,6 @@ echo "  monitor  /usr/local/bin/juno-fan-monitor"
 echo "  knobs    /usr/local/bin/juno-fan-curve (FCTEMPS source for knob curves)"
 echo "  helper   $HELPER"
 echo "  drop-in  $DROPIN/30-juno-fancontrol.conf"
-echo "  resume   /usr/lib/systemd/system-sleep/fancontrol-resume"
 echo "  policy   /usr/share/polkit-1/actions/org.juno.kdefancontrol.policy"
 echo "  launcher /usr/share/applications/juno-{kde-fancontrol,fan-monitor}.desktop"
 echo "  autostart /etc/xdg/autostart/juno-fan-monitor.desktop"
