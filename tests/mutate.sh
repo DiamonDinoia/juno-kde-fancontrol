@@ -32,7 +32,7 @@ flock -n 9 || { echo "another sweep holds $LOCK -- refusing to run"; exit 1; }
 BK=$(mktemp -d)
 OUT=$(mktemp -d)
 FILES=(backend/fancore.py backend/ktheme.py backend/sysmon.py juno-fancontrol-apply fan-profile fan-calibrate app.py fancurve.py tray.py
-       systemd/30-juno-fancontrol.conf debian/install debian/postinst debian/prerm)
+       systemd/30-juno-fancontrol.conf debian/install debian/postinst debian/prerm install.sh)
 save()    { for f in "${FILES[@]}"; do mkdir -p "$BK/$(dirname "$f")"; cp "$f" "$BK/$f"; done; }
 restore() { find . -name __pycache__ -type d -prune -exec rm -rf {} + ; for f in "${FILES[@]}"; do cp "$BK/$f" "$f"; done; }
 trap 'restore; rm -rf "$BK" "$OUT"; echo "[trap] tree restored"' EXIT
@@ -60,6 +60,13 @@ syslane() {  # -> space-separated failed static systemd/packaging checks (host-s
     grep -q 'system-sleep/\.fancontrol\.juno-diverted' debian/postinst || s+="divert-target-visible-postinst "
     grep -q 'system-sleep/\.fancontrol\.juno-diverted' debian/prerm || s+="divert-target-visible-prerm "
     grep -q 'install -m 755 "$SLP_NOOP" "$SLP"' debian/postinst || s+="noop-reinstall-missing "
+    # The pre-deb resume hook must stay reaped by both lanes (install.sh for
+    # the source lane, postinst for the deb lane's unowned leftovers).
+    grep -q 'rm -f /usr/lib/systemd/system-sleep/fancontrol-resume' install.sh || s+="installsh-hook-rm-missing "
+    grep -q 'rm -f /usr/lib/systemd/system-sleep/fancontrol-resume' debian/postinst || s+="postinst-hook-rm-missing "
+    # Diversion half-state (entry gone, stale .juno-diverted on disk, upstream
+    # hook live) must move the stale copy aside and retry, not just warn.
+    grep -q 'mv "$SLP_DIV" "$SLP_DIV.stale"' debian/postinst || s+="half-state-fallback-missing "
     echo "${s% }"
 }
 
@@ -347,6 +354,32 @@ mutate M59-divert-target-visible-prerm debian/prerm \
 # upgrade: the no-op is only ever placed once.
 mutate M60-noop-reinstall-dropped debian/postinst \
     '/install -m 755 "$SLP_NOOP" "$SLP"/d'
+# The pre-deb fancontrol-resume hook must be reaped by both lanes; a dropped
+# rm leaves the try-restart-on-resume hook (one 255 blip per resume) alive.
+mutate M61-installsh-hook-rm-dropped install.sh \
+    '/rm -f \/usr\/lib\/systemd\/system-sleep\/fancontrol-resume/d'
+mutate M62-postinst-hook-rm-dropped debian/postinst \
+    '/rm -f \/usr\/lib\/systemd\/system-sleep\/fancontrol-resume/d'
+# Without the stale-copy fallback a half-state (entry gone, .juno-diverted
+# still on disk, upstream hook live again) fails the re-divert permanently;
+# the container gate's deb lane kills the same arm behaviourally.
+pymutate M63-half-state-fallback-dropped debian/postinst \
+    '            # Half-state: the entry is gone but a stale diverted copy still
+            # sits at $SLP_DIV while the live path carries the upstream hook
+            # again, so the --rename above failed (rc 2, "rename involves
+            # overwriting") and rolled the entry back. Move the stale copy
+            # aside under a fixed name and try the divert once more.
+            if [ -e "$SLP_DIV" ]; then
+                echo "juno-kde-fancontrol: WARNING: moving stale $SLP_DIV to $SLP_DIV.stale to recover the diversion" >&2
+                mv "$SLP_DIV" "$SLP_DIV.stale"
+                dpkg-divert --package juno-kde-fancontrol --add --rename --divert "$SLP_DIV" "$SLP" \
+                    || echo "juno-kde-fancontrol: WARNING: could not divert $SLP; the upstream resume hook stays live" >&2
+            else
+                echo "juno-kde-fancontrol: WARNING: could not divert $SLP; the upstream resume hook stays live" >&2
+            fi
+' \
+    '            echo "juno-kde-fancontrol: WARNING: could not divert $SLP; the upstream resume hook stays live" >&2
+'
 
 restore
 echo "== after restore: $(run)"

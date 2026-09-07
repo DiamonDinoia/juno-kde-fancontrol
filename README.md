@@ -323,6 +323,22 @@ re-blasts 255. So nothing in the runtime path does:
   `Restart=on-failure` with `StartLimitBurst=3` over 180 s instead of
   `Restart=always`.
 
+When all three starts burn inside the 180 s window, systemd parks the unit in
+the *failed* state and refuses further restarts — a daemon that keeps crashing
+stays down until the counter is reset. After fixing the cause:
+
+```sh
+sudo systemctl reset-failed fancontrol.service && sudo systemctl start fancontrol.service
+```
+
+**Operator rule — stop the daemon before any clevofan module reload.**
+`modprobe -r clevofan` pulls the hwmon out from under a running fancontrol,
+whose exit lands in its `pwmdisable` fallback; on this driver `enable=0` and
+`enable=2` both read back as auto, so the fallback selects `enable=1` +
+`pwm=255` — a crashed or mid-reload stop parks the fans at full speed. The
+safe sequence is `systemctl stop fancontrol.service`, reload the module, then
+`systemctl start fancontrol.service`.
+
 ## Panel widgets (System Monitor sensors)
 
 The tray popup is one click away; a permanent readout belongs on the panel.
@@ -401,7 +417,7 @@ dpkg-buildpackage -us -uc -b --root-command=fakeroot   # needs dpkg-dev debhelpe
 bash tests/run-container.sh        # clean debian:unstable container: 210 unit
                                    # tests, 135 helper integration checks
                                    # (regen label contract vs the packaged
-                                   # fan-profile, restart hygiene), 85 deb
+                                   # fan-profile, restart hygiene), 90 deb
                                    # build/install/verify checks, 11 offscreen
                                    # renders (4 GUI, 7 tray) plus the defect
                                    # controls
@@ -430,7 +446,7 @@ stops matching the transcription the test evaluates. Knob mode gets the same
 treatment: `pwm_at(t) * 1000` goes through that arithmetic under the transfer
 calibration and the commanded PWM must come back bit for bit.
 
-Every gate here has been shown able to fail. Sixty-one mutations each break
+Every gate here has been shown able to fail. Sixty-four mutations each break
 at least one named check, spread across the curve law and helper, the
 themability of the paintings, the GPU-fan wiring (a sleeping card must never
 be polled), the tray's probe persistence, and the restart hygiene (drop-in

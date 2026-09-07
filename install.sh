@@ -27,6 +27,8 @@ sed 's|/usr/bin/fan-profile|/usr/local/bin/fan-profile|' \
 # manual duty after S3/S4, so restarting fancontrol on resume only blips 255.
 # (The deb additionally dpkg-diverts the fancontrol package's own hook over
 # systemd/fancontrol-sleep-noop; a source install leaves that hook alone.)
+# Pre-deb-era removal: ≤0.6.2 installed this hook and the name was only ever ours.
+rm -f /usr/lib/systemd/system-sleep/fancontrol-resume
 install -D -m644 "$SELF/rapl-readable.rules" \
     /usr/local/share/juno-kde-fancontrol/rapl-readable.rules
 

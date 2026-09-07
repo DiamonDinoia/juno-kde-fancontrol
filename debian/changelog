@@ -1,3 +1,32 @@
+juno-kde-fancontrol (0.6.3+diamon2) unstable; urgency=low
+
+  * Reap the stale source-install resume hook: install.sh ≤0.6.2 wrote
+    /usr/lib/systemd/system-sleep/fancontrol-resume (try-restart on resume,
+    one 255 blip per wake) and neither lane ever deleted it. Both install.sh
+    and debian/postinst now rm -f it by name — the name was only ever ours;
+    postinst's copy covers the deb lane, where dpkg removes only the file it
+    tracks and a source-installed copy is unowned.
+  * postinst recovers the diversion half-state: diversion entry gone while
+    /usr/lib/systemd/system-sleep/.fancontrol.juno-diverted is still on disk
+    and the upstream hook is live again makes dpkg-divert --add --rename fail
+    (rc 2, "rename involves overwriting") and roll the entry back, which used
+    to leave the upstream resume hook running behind a warning. The stale copy
+    now moves aside to .fancontrol.juno-diverted.stale (with a warning) and
+    the divert+rename+no-op is retried; a foreign diversion is still refused
+    and the happy path stays idempotent.
+  * The /etc drop-in warning no longer claims every drop-in entirely shadows
+    the packaged one: a drop-in named 30-juno-fancontrol.conf shadows
+    /usr/lib/systemd/system/fancontrol.service.d/30-juno-fancontrol.conf
+    entirely, a differently-named one merges key-by-key; the warning and the
+    comment now name the files and say which is which.
+  * README: recovery from a parked daemon (reset-failed + start after three
+    crashes inside the 180 s StartLimit window) and the operator rule to stop
+    fancontrol.service before any clevofan module reload — a mid-reload daemon
+    exit lands in the pwmdisable fallback, which writes enable=1 + pwm=255 on
+    this driver and parks the fans at full speed.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Mon, 07 Sep 2026 18:30:00 -0400
+
 juno-kde-fancontrol (0.6.3+diamon1) unstable; urgency=low
 
   * Kill the routine full-speed bursts. fancontrol writes 255 to every pwm at

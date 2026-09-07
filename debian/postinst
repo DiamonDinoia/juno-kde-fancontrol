@@ -18,17 +18,24 @@ juno-kde-fancontrol: NOTE
 EOF
 fi
 
-# Any drop-in under /etc entirely shadows the packaged one in /usr/lib (same
-# instance name), including its Restart policy and ExecStartPre chain. Warn
-# and name the file(s); removing them is the admin's call, not the installer's.
+# A drop-in under /etc with the same name as the packaged one shadows it
+# entirely (including its Restart policy and ExecStartPre chain); a
+# differently-named one only merges key-by-key. Warn and name the file(s);
+# removing them is the admin's call, not the installer's.
+PKGDROP=/usr/lib/systemd/system/fancontrol.service.d/30-juno-fancontrol.conf
 shopt -s nullglob
 ovr=(/etc/systemd/system/fancontrol.service.d/*.conf)
 if ((${#ovr[@]})); then
-    echo "juno-kde-fancontrol: WARNING: drop-in(s) under /etc/systemd/system/fancontrol.service.d/ entirely shadow the packaged one:" >&2
+    echo "juno-kde-fancontrol: WARNING: drop-in(s) under /etc/systemd/system/fancontrol.service.d/ override the packaged $PKGDROP:" >&2
     printf '  %s\n' "${ovr[@]}" >&2
-    echo "  review or remove, or the drop-in changes this package ships never take effect." >&2
+    echo "  a same-named one shadows it entirely; a differently-named one merges key-by-key." >&2
+    echo "  review or remove, or the packaged drop-in's changes may never take effect." >&2
 fi
 shopt -u nullglob
+
+# Pre-deb-era removal, the name was only ever ours: dpkg removes only the file
+# it tracks, so postinst deletes a source-installed unowned copy by name here.
+rm -f /usr/lib/systemd/system-sleep/fancontrol-resume
 
 # Neutralize the fancontrol deb's resume hook, which restarts the daemon on
 # every resume — and every fancontrol start blips 255 onto each pwm (its
@@ -55,8 +62,21 @@ if [ "$divertor" != "juno-kde-fancontrol" ]; then
         if [ -e "$SLP_DIV" ]; then
             echo "juno-kde-fancontrol: WARNING: $SLP lost its diversion while $SLP_DIV still exists — re-diverting" >&2
         fi
-        dpkg-divert --package juno-kde-fancontrol --add --rename --divert "$SLP_DIV" "$SLP" \
-            || echo "juno-kde-fancontrol: WARNING: could not divert $SLP; the upstream resume hook stays live" >&2
+        if ! dpkg-divert --package juno-kde-fancontrol --add --rename --divert "$SLP_DIV" "$SLP"; then
+            # Half-state: the entry is gone but a stale diverted copy still
+            # sits at $SLP_DIV while the live path carries the upstream hook
+            # again, so the --rename above failed (rc 2, "rename involves
+            # overwriting") and rolled the entry back. Move the stale copy
+            # aside under a fixed name and try the divert once more.
+            if [ -e "$SLP_DIV" ]; then
+                echo "juno-kde-fancontrol: WARNING: moving stale $SLP_DIV to $SLP_DIV.stale to recover the diversion" >&2
+                mv "$SLP_DIV" "$SLP_DIV.stale"
+                dpkg-divert --package juno-kde-fancontrol --add --rename --divert "$SLP_DIV" "$SLP" \
+                    || echo "juno-kde-fancontrol: WARNING: could not divert $SLP; the upstream resume hook stays live" >&2
+            else
+                echo "juno-kde-fancontrol: WARNING: could not divert $SLP; the upstream resume hook stays live" >&2
+            fi
+        fi
     fi
 fi
 if [ "$(dpkg-divert --listpackage "$SLP" 2>/dev/null || true)" = "juno-kde-fancontrol" ]; then

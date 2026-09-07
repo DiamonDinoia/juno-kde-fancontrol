@@ -79,14 +79,20 @@ dpkg-deb -f "$DEB" Depends | grep -q libksysguardsystemstats2 && ok dep-shlibs-r
 # --- install + verify (real apt resolution on Debian unstable) -------------------
 # --no-install-recommends: the Recommends are fan-calibrate's audio stack,
 # which nothing in this gate exercises and which costs minutes to fetch.
+# A pre-deb source install (<=0.6.2) left this resume hook on disk unowned by
+# dpkg; postinst's rm must take it out on install (created after install.sh
+# ran, so the source lane cannot be the remover).
+printf '#!/bin/bash\nexit 0\n' > /usr/lib/systemd/system-sleep/fancontrol-resume
 if apt-get install -y -qq --no-install-recommends "$DEB" > /tmp/deb-install.log 2>&1; then
     ok deb-install
 else
     bad deb-install "$(tail -8 /tmp/deb-install.log)"
 fi
-# the /usr/local lane left its drop-in under /etc: postinst must name it — a
-# drop-in there entirely shadows the deb's /usr/lib drop-ins, so the Restart
-# policy and ExecStartPre chain this package ships would never take effect
+[[ ! -e /usr/lib/systemd/system-sleep/fancontrol-resume ]] \
+    && ok resume-hook-stale-removed || bad resume-hook-stale-removed "unowned copy survived install"
+# the /usr/local lane left its drop-in under /etc: postinst must name it —
+# the file is same-named, so it shadows the deb's /usr/lib drop-in entirely
+# and the Restart policy and ExecStartPre chain this package ships never run
 postinst_out=$(bash /var/lib/dpkg/info/juno-kde-fancontrol.postinst configure 2>&1)
 grep -q "/etc/systemd/system/fancontrol.service.d/30-juno-fancontrol.conf" <<< "$postinst_out" \
     && ok postinst-warns-etc-dropin || bad postinst-warns-etc-dropin "$postinst_out"
@@ -181,6 +187,26 @@ cmp -s "$HOOK" /usr/share/juno-kde-fancontrol/fancontrol-sleep-noop \
     && ok hook-idempotent || bad hook-idempotent "$(cat "$HOOK")"
 [[ "$(dpkg-divert --listpackage "$HOOK" 2>/dev/null)" == juno-kde-fancontrol ]] \
     && ok hook-still-diverted || bad hook-still-diverted "diversion lost on re-run"
+# half-state recovery: diversion entry gone, the diverted original still on
+# disk, and the live path carrying the upstream hook again (an admin or a
+# fancontrol reinstall gone sideways). dpkg-divert --add --rename then fails
+# rc 2 ("rename involves overwriting") and rolls the entry back; postinst must
+# move the stale copy aside to .stale, retry and leave the no-op live.
+SLP_DIV=/usr/lib/systemd/system-sleep/.fancontrol.juno-diverted
+dpkg-divert --package juno-kde-fancontrol --remove --divert "$SLP_DIV" "$HOOK"
+cp "$SLP_DIV" "$HOOK"
+half_out=$(bash /var/lib/dpkg/info/juno-kde-fancontrol.postinst configure 2>&1)
+[[ "$(dpkg-divert --listpackage "$HOOK" 2>/dev/null)" == juno-kde-fancontrol ]] \
+    && ok hook-rediverted-from-half-state \
+    || bad hook-rediverted-from-half-state "$(dpkg-divert --listpackage "$HOOK" 2>&1)"
+cmp -s "$HOOK" /usr/share/juno-kde-fancontrol/fancontrol-sleep-noop \
+    && ok hook-noop-after-half-state || bad hook-noop-after-half-state "$(cat "$HOOK")"
+[[ -f "$SLP_DIV.stale" ]] \
+    && ok stale-diverted-moved-aside \
+    || bad stale-diverted-moved-aside "$(ls -a /usr/lib/systemd/system-sleep/)"
+grep -q "stale" <<< "$half_out" \
+    && ok half-state-warns || bad half-state-warns "$half_out"
+rm -f "$SLP_DIV.stale"
 # prerm hands the hook back on remove (static check; removal runs nowhere here)
 grep -q "dpkg-divert --package juno-kde-fancontrol --remove" \
     /var/lib/dpkg/info/juno-kde-fancontrol.prerm \
