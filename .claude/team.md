@@ -110,3 +110,15 @@ start; residual after this fix: boot-time-only. Sep-04 13:26 crash = user's
 own sudo modprobe -r (attribution in logbook).
 Dead tach on fan2 (GPU fan) remains unexplained — reads 0 while fan spins;
 no evidence it causes bursts (manual-mode readback returns the cached duty).
+
+### Closeout addendum (2026-09-07, audit round)
+Triple adversarial audit after publish (fix correctness / publish chain /
+audit-of-audits): publish chain sound (hash chain verified, cron-safe).
+Fixes shipped as 0.6.3+diamon2 (8477058): F1 stale source-install resume
+hook removed in install.sh+postinst; F3 postinst half-state fallback
+(mv-aside + retry on dpkg-divert rc=2); F5 override-warning wording;
+README parked-daemon recovery + clevofan-reload rule. Gates: container 262
+PASS (deb 90), sweep 64 fired / 0 missed, helper 135, pytest 210.
+Open follow-ups handed back: dead-tach pwm2 MINSTART pulse (FCFANS remap
+trial), dpkg --root upgrade lane for test_deb, ExecStopPost hand-back to EC.
+Host-side stale files listed for user removal (sudo is theirs).
