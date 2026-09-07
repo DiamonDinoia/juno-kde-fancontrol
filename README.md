@@ -2,10 +2,10 @@
 
 The whole fan stack for Juno (Clevo) laptops in one Debian package: the
 `fan-profile` CLI, the systemd drop-in that keeps `fancontrol` pinned to this
-boot's hwmon indices, the suspend/resume hook, a KDE/Qt6 curve editor and a
-system-tray monitor. Everything sits on top of stock `fancontrol` rather than
-replacing it. Pure Python/PySide6 (System 6 KCMs are C++ plugins, so the
-editor is a standalone app).
+boot's hwmon indices, a KDE/Qt6 curve editor and a system-tray monitor.
+Everything sits on top of stock `fancontrol` rather than replacing it. Pure
+Python/PySide6 (System 6 KCMs are C++ plugins, so the editor is a standalone
+app).
 
 ![quiet](screenshot.png)
 
@@ -47,8 +47,11 @@ editor is a standalone app).
   re-resolved from `/sys` at apply time — they drift between boots), honors
   the calibrated cap unless
   the preset is `turbo`, validates with `fancontrol --check` (syntax), then
-  restarts `fancontrol.service` and probes `is-active` (the real device
-  gate — `regen` in the service's ExecStartPre re-validates indices). On any
+  restarts `fancontrol.service` when the curve bytes actually changed and
+  probes `is-active` (the real device
+  gate — `regen` in the service's ExecStartPre re-validates indices). An
+  unchanged curve leaves the running daemon alone: every fancontrol start
+  blips 255 onto the pwms. On any
   failure it restores the previous config AND restarts the previous daemon.
 
 ## Knob curves
@@ -280,8 +283,8 @@ fixture tree with no hardware at all.
 | `/usr/bin/juno-gpu-curve` | the same for the GPU fan (pwm2) off the dGPU temperature |
 | `/usr/bin/juno-gpu-temp` | plain dGPU millidegrees source for native configs |
 | `/usr/sbin/juno-fancontrol-apply` | root helper behind pkexec |
-| `…/fancontrol.service.d/30-juno-fancontrol.conf` | `Restart=always` + the boot-time `fan-profile regen` |
-| `/usr/lib/systemd/system-sleep/fancontrol-resume` | re-attach the curve after resume |
+| `…/fancontrol.service.d/30-juno-fancontrol.conf` | `Restart=on-failure` + the boot-time `fan-profile regen` |
+| `/usr/share/juno-kde-fancontrol/fancontrol-sleep-noop` | no-op installed over the fancontrol deb's resume hook via `dpkg-divert` |
 | `…/plasma/systemsettings/externalmodules/juno-fancontrol-settings.desktop` | the System Settings entry, see [above](#systemsettings-integration) |
 | `/usr/share/juno-kde-fancontrol/rapl-readable.rules` | optional udev rule, not active until installed |
 | `…/qt6/plugins/ksystemstats/ksystemstats_plugin_juno.so` | registers the laptop's sensors with `ksystemstats` so any System Monitor widget can show them |
@@ -289,6 +292,36 @@ fixture tree with no hardware at all.
 The drop-in is named `30-` so it sorts after the hand-installed `10-restart.conf`
 and `20-resync.conf` that predate this package. Its `ExecStartPre=` reset then
 wins, and the two older files become inert rather than needing deletion.
+
+## The boot blast, and the restarts that no longer happen
+
+`fancontrol` writes 255 to every pwm at **every** start (its `pwmenable`
+path). The full-speed rush heard when the machine powers on is almost all
+firmware: the EC runs its loud default curve from POST until the daemon
+acquires the pwms (~1.5 s into userspace, hence the `Before=basic.target`
+takeover in the drop-in), and the daemon's first `pwmenable` adds a residual
+blip of under a second on top. That first-start ritual is accepted — the EC
+curve before it is longer and louder anyway.
+
+What routine operation must not do is *restart* the daemon, because each one
+re-blasts 255. So nothing in the runtime path does:
+
+- **Resume needs no restart.** clevofan's PM notifier re-asserts the cached
+  manual duty on `PM_POST_SUSPEND`/`PM_POST_HIBERNATION`/`PM_POST_RESTORE`,
+  `pwmN_enable` survives S3/S4, and the daemon rewrites pwm every `INTERVAL`
+  anyway. The package's own resume hook is gone (0.6.3), and the hook shipped
+  by the `fancontrol` deb itself is diverted over a no-op at install time —
+  to a dot-prefixed name, because `systemd-sleep` executes every non-hidden
+  executable in `system-sleep/`, and a visible divert target would run both
+  hooks on every resume.
+- **Re-applying an unchanged curve skips the restart.** `fan-profile`,
+  `juno-fancontrol-apply` and `fan-calibrate --apply` compare the new config
+  against `/etc/fancontrol` excluding line 1's minute-grain timestamp; equal
+  bytes plus a running daemon means no restart. A stopped daemon is simply
+  started. Only real curve changes (and boots) start the daemon.
+- **A crash loop can no longer blast forever.** The drop-in runs
+  `Restart=on-failure` with `StartLimitBurst=3` over 180 s instead of
+  `Restart=always`.
 
 ## Panel widgets (System Monitor sensors)
 
@@ -366,11 +399,12 @@ dpkg-buildpackage -us -uc -b --root-command=fakeroot   # needs dpkg-dev debhelpe
 
 ```sh
 bash tests/run-container.sh        # clean debian:unstable container: 210 unit
-                                   # tests, 125 helper integration checks
+                                   # tests, 135 helper integration checks
                                    # (regen label contract vs the packaged
-                                   # fan-profile), 31 deb build/install/verify
-                                   # checks, 11 offscreen renders (4 GUI,
-                                   # 7 tray) plus the defect controls
+                                   # fan-profile, restart hygiene), 85 deb
+                                   # build/install/verify checks, 11 offscreen
+                                   # renders (4 GUI, 7 tray) plus the defect
+                                   # controls
 bash tests/mutate.sh               # positive controls: breaks one thing at a
                                    # time and fails if a gate stays green
 bash tests/test_settings_entry.sh  # needs systemsettings; stages the entry in
@@ -396,10 +430,11 @@ stops matching the transcription the test evaluates. Knob mode gets the same
 treatment: `pwm_at(t) * 1000` goes through that arithmetic under the transfer
 calibration and the commanded PWM must come back bit for bit.
 
-Every gate here has been shown able to fail. Forty-four mutations each break
+Every gate here has been shown able to fail. Sixty-one mutations each break
 at least one named check, spread across the curve law and helper, the
 themability of the paintings, the GPU-fan wiring (a sleeping card must never
-be polled), and the tray's probe persistence. The tree is verified green
+be polled), the tray's probe persistence, and the restart hygiene (drop-in
+policy, hook diversion, restart-only-on-change). The tree is verified green
 before and after each sweep.
 
 ## Files
@@ -408,7 +443,7 @@ before and after each sweep.
 |---|---|
 | `fan-profile` | profile CLI and the boot-time `regen` that re-pins hwmon indices |
 | `fan-calibrate` | microphone-based PWM noise calibration |
-| `systemd/` | fancontrol drop-in and the suspend/resume hook |
+| `systemd/` | fancontrol drop-in and the no-op that neutralizes the fancontrol deb's resume hook |
 | `rapl-readable.rules` | opt-in udev rule for the root-only RAPL energy counter |
 | `app.py` | PySide6 GUI (chart, editor, live sensors, pkexec apply) |
 | `tray.py` | PySide6 tray monitor (temps, fans, GPUs, network, power, battery) |

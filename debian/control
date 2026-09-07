@@ -33,8 +33,9 @@ Suggests: nvidia-smi,
 Description: fan control and system monitor for Juno (Clevo) laptops
  The whole fan stack for this laptop family in one package: the fan-profile
  CLI (quiet/balanced/cool/turbo/auto), the systemd drop-in that re-resolves
- drifting hwmon indices before fancontrol starts, the suspend/resume hook, a
- KDE/Qt6 curve editor and a system-tray monitor.
+ drifting hwmon indices before fancontrol starts, a no-op replacement for the
+ fancontrol deb's resume hook (clevofan's PM notifier already re-asserts the
+ duty after resume), a KDE/Qt6 curve editor and a system-tray monitor.
  .
  The editor shows CPU temperature, fan RPM and PWM duty live, with a draggable
  pwm = f(temp) chart matching the fancontrol control law. Clicking the plot adds

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Installed by juno-kde-fancontrol over the fancontrol deb's resume hook
+# (/usr/lib/systemd/system-sleep/fancontrol, replaced via dpkg-divert in
+# debian/postinst). The upstream hook restarts fancontrol on every resume,
+# and every fancontrol start blips 255 onto each pwm (its pwmenable path), so
+# every resume was a full-speed burst.
+#
+# No restart is needed: clevofan's PM notifier re-asserts the cached manual
+# duty on PM_POST_SUSPEND/PM_POST_HIBERNATION/PM_POST_RESTORE and pwmN_enable
+# survives S3/S4 (module audit, 2026-09-05), and the daemon rewrites pwm every
+# INTERVAL regardless. This hook deliberately does nothing.
+exit 0

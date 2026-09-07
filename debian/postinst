@@ -18,6 +18,52 @@ juno-kde-fancontrol: NOTE
 EOF
 fi
 
+# Any drop-in under /etc entirely shadows the packaged one in /usr/lib (same
+# instance name), including its Restart policy and ExecStartPre chain. Warn
+# and name the file(s); removing them is the admin's call, not the installer's.
+shopt -s nullglob
+ovr=(/etc/systemd/system/fancontrol.service.d/*.conf)
+if ((${#ovr[@]})); then
+    echo "juno-kde-fancontrol: WARNING: drop-in(s) under /etc/systemd/system/fancontrol.service.d/ entirely shadow the packaged one:" >&2
+    printf '  %s\n' "${ovr[@]}" >&2
+    echo "  review or remove, or the drop-in changes this package ships never take effect." >&2
+fi
+shopt -u nullglob
+
+# Neutralize the fancontrol deb's resume hook, which restarts the daemon on
+# every resume — and every fancontrol start blips 255 onto each pwm (its
+# pwmenable path), so every resume was a full-speed burst. No restart is
+# needed: clevofan's PM notifier re-asserts the cached manual duty on
+# PM_POST_SUSPEND/PM_POST_HIBERNATION/PM_POST_RESTORE and pwmN_enable survives
+# S3/S4. Divert the hook and put a no-op in its place; a fancontrol reinstall
+# then rewrites the diverted original, never the live path.
+# The divert target MUST be dot-prefixed (or live outside the dir):
+# systemd-sleep executes every non-hidden executable in system-sleep/ — only
+# dot-names, *~ and a fixed suffix list are skipped — so a visible target like
+# $SLP.juno-diverted would keep BOTH hooks running on every resume.
+SLP=/usr/lib/systemd/system-sleep/fancontrol
+SLP_DIV=/usr/lib/systemd/system-sleep/.fancontrol.juno-diverted
+SLP_NOOP=/usr/share/juno-kde-fancontrol/fancontrol-sleep-noop
+divertor=$(dpkg-divert --listpackage "$SLP" 2>/dev/null || true)
+if [ "$divertor" != "juno-kde-fancontrol" ]; then
+    if [ -n "$divertor" ]; then
+        echo "juno-kde-fancontrol: WARNING: $SLP is diverted by '$divertor' (expected juno-kde-fancontrol); leaving it alone" >&2
+    else
+        # A diverted original still on disk means we diverted it before and
+        # the entry vanished (admin or a fancontrol reinstall went sideways):
+        # that state earns a warning; a first install does not.
+        if [ -e "$SLP_DIV" ]; then
+            echo "juno-kde-fancontrol: WARNING: $SLP lost its diversion while $SLP_DIV still exists — re-diverting" >&2
+        fi
+        dpkg-divert --package juno-kde-fancontrol --add --rename --divert "$SLP_DIV" "$SLP" \
+            || echo "juno-kde-fancontrol: WARNING: could not divert $SLP; the upstream resume hook stays live" >&2
+    fi
+fi
+if [ "$(dpkg-divert --listpackage "$SLP" 2>/dev/null || true)" = "juno-kde-fancontrol" ]; then
+    # Keep the no-op in place even if something rewrote the hook after diversion.
+    install -m 755 "$SLP_NOOP" "$SLP"
+fi
+
 if [ -d /run/systemd/system ]; then
     # A failed reload must not abort the install, but it must not vanish either.
     systemctl daemon-reload \

@@ -17,5 +17,5 @@ juno-fan-monitor.desktop etc/xdg/autostart/
 juno-fancontrol-settings.desktop usr/share/plasma/systemsettings/externalmodules/
 org.juno.kdefancontrol.policy usr/share/polkit-1/actions/
 systemd/30-juno-fancontrol.conf usr/lib/systemd/system/fancontrol.service.d/
-systemd/fancontrol-resume usr/lib/systemd/system-sleep/
+systemd/fancontrol-sleep-noop usr/share/juno-kde-fancontrol/
 rapl-readable.rules usr/share/juno-kde-fancontrol/

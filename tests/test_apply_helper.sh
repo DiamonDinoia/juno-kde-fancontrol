@@ -289,7 +289,10 @@ grep -q "temp1_input" "$ROOT/etc/fancontrol" \
 # `fan-profile regen`, so this pins that a reboot does not rewrite the transfer
 # calibration. Clamping MAXPWM to the 150 noise cap here would rescale every
 # commanded pwm by 150/255 -- a silently 41% slower fan.
+# rm the config first: an unchanged apply no longer restarts (T23's skip), so
+# without the fresh-boot shape this block would never replay regen at all.
 make_tree 2; reset_state; real_fpwrap
+rm -f "$ROOT/etc/fancontrol"
 out=$("$APPLY" --knobs "$KN" "${XFER[@]}" 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok T14-knob-apply-restart || bad T14-knob-apply-restart "rc=$rc $out"
 grep -qx "MAXPWM=hwmon7/pwm1=255 hwmon7/pwm2=255" "$ROOT/etc/fancontrol" \
@@ -483,7 +486,10 @@ grep -qx "# Knobs pwm2: $GKN" "$ROOT/etc/fancontrol" && ok T21c-gpu-line \
 
 # T21d: boot contract with two curves: regen keeps both lines and refreshes BOTH
 # executable sources after an index drift, byte-identical each time.
+# rm the config first: T21c wrote this exact dual config, and an unchanged
+# apply no longer restarts (T23's skip) — this block exists to replay regen.
 make_tree 2; make_dgpu; reset_state
+rm -f "$ROOT/etc/fancontrol"
 "$APPLY" --knobs "$KN" --gpu-knobs "$GKN" "${XFER[@]}" >/dev/null 2>&1
 grep -qx "MAXPWM=hwmon7/pwm1=255 hwmon7/pwm2=255" "$ROOT/etc/fancontrol" \
     && ok T21d-xfer-survived-restart \
@@ -674,6 +680,10 @@ grep -qx "MAXPWM=hwmon7/pwm1=100 hwmon7/pwm2=100" "$ROOT/etc/fancontrol" \
     || bad T22g-calibrate-recaps-both-bands "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
 [[ "$(cat "$ROOT/etc/fan-profile.maxpwm")" == "100" ]] \
     && ok T22g-cap-written || bad T22g-cap-written "$(cat "$ROOT/etc/fan-profile.maxpwm")"
+# the re-cap changed MAXPWM (120 -> 100), so the daemon must restart, once
+[[ "$(grep -c '^restart fancontrol.service$' "$ROOT/state/systemctl.log")" == 1 ]] \
+    && ok T22g-change-restarts-once \
+    || bad T22g-change-restarts-once "$(cat "$ROOT/state/systemctl.log")"
 echo 150 > "$ROOT/etc/fan-profile.maxpwm"
 
 # T22h: same routing keeps a knob config a knob config (both lines carried and
@@ -689,6 +699,64 @@ grep -qx "# Knobs pwm1: $KN" "$ROOT/etc/fancontrol" \
     && grep -qx "# Knobs pwm2: $GKN" "$ROOT/etc/fancontrol" \
     && ok T22h-calibrate-keeps-knobs \
     || bad T22h-calibrate-keeps-knobs "$(grep '^# Knobs' "$ROOT/etc/fancontrol")"
+# cap 150 with every knob already <= 150: re-cap is a no-op, so no restart
+# (every fancontrol start blips 255 onto each pwm)
+[[ "$(grep -c '^restart fancontrol.service$' "$ROOT/state/systemctl.log")" == 0 ]] \
+    && ok T22h-unchanged-skips-restart \
+    || bad T22h-unchanged-skips-restart "$(cat "$ROOT/state/systemctl.log")"
+
+# --- T23: restart only when the effective config changed ----------------------
+# Every fancontrol start blips 255 onto each pwm (its pwmenable path), so a
+# restart whose curve bytes did not change is an audible full-speed burst for
+# nothing. The compare excludes line 1's minute-grain timestamp, so a
+# re-apply in the same minute AND one whose stamp crossed a minute both skip;
+# the systemctl stub's call log is the restart counter.
+restarts() { grep -c '^restart fancontrol.service$' "$ROOT/state/systemctl.log"; }
+make_tree 2; reset_state; real_fpwrap
+"$APPLY" 10 60 95 70 50 0 120 4 quiet >/dev/null 2>&1   # baseline: changed -> 1 restart
+[[ "$(restarts)" == 1 ]] || bad T23-setup "$(cat "$ROOT/state/systemctl.log")"
+
+: > "$ROOT/state/systemctl.log"
+out=$("$APPLY" 10 60 95 70 50 0 120 4 quiet 2>&1)       # same minute, same curve
+[[ "$(restarts)" == 0 ]] && ok T23-apply-same-minute-no-restart \
+    || bad T23-apply-same-minute-no-restart "$(cat "$ROOT/state/systemctl.log")"
+grep -q "restart skipped" <<< "$out" && ok T23-apply-skip-logs \
+    || bad T23-apply-skip-logs "$out"
+
+: > "$ROOT/state/systemctl.log"
+JFC_NOW="2026-09-05 11:11" "$APPLY" 10 60 95 70 50 0 120 4 quiet >/dev/null 2>&1
+[[ "$(restarts)" == 0 ]] && ok T23-apply-next-minute-no-restart \
+    || bad T23-apply-next-minute-no-restart "$(cat "$ROOT/state/systemctl.log")"
+
+# the fan-profile CLI path gets the same treatment through FP_NOW (fpwrap
+# resolves systemctl from PATH, so put the stub first)
+: > "$ROOT/state/systemctl.log"
+FP_NOW="2026-09-05 09:09" PATH="$ROOT/bin:$PATH" "$ROOT/bin/fpwrap" quiet >/dev/null 2>&1
+[[ "$(restarts)" == 0 ]] && ok T23-cli-same-minute-no-restart \
+    || bad T23-cli-same-minute-no-restart "$(cat "$ROOT/state/systemctl.log")"
+: > "$ROOT/state/systemctl.log"
+FP_NOW="2026-09-05 09:10" PATH="$ROOT/bin:$PATH" "$ROOT/bin/fpwrap" quiet >/dev/null 2>&1
+[[ "$(restarts)" == 0 ]] && ok T23-cli-next-minute-no-restart \
+    || bad T23-cli-next-minute-no-restart "$(cat "$ROOT/state/systemctl.log")"
+
+# a changed curve must restart, exactly once
+: > "$ROOT/state/systemctl.log"
+"$APPLY" 10 55 90 60 45 40 100 4 balanced >/dev/null 2>&1
+[[ "$(restarts)" == 1 ]] && ok T23-change-restarts-once \
+    || bad T23-change-restarts-once "$(cat "$ROOT/state/systemctl.log")"
+
+# daemon down: the apply starts it, compare moot (restart starts an inactive
+# unit — the stub's restart arm stands in for start). Re-establish quiet
+# first: the restart replay above rewrote the config from the preset table,
+# so only the preset's own values compare equal on a re-apply.
+"$APPLY" 10 60 95 70 50 0 120 4 quiet >/dev/null 2>&1
+: > "$ROOT/state/systemctl.log"; echo stopped > "$ROOT/state/unit.state"
+"$APPLY" 10 60 95 70 50 0 120 4 quiet >/dev/null 2>&1
+[[ "$(restarts)" == 1 ]] && ok T23-inactive-started \
+    || bad T23-inactive-started "$(cat "$ROOT/state/systemctl.log")"
+[[ "$(cat "$ROOT/state/unit.state")" == active ]] && ok T23-inactive-now-active \
+    || bad T23-inactive-now-active "$(cat "$ROOT/state/unit.state")"
+reset_state
 
 echo
 echo "helper tests: $PASS passed, $FAIL failed"

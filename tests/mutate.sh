@@ -31,7 +31,8 @@ exec 9>"$LOCK" || exit 1
 flock -n 9 || { echo "another sweep holds $LOCK -- refusing to run"; exit 1; }
 BK=$(mktemp -d)
 OUT=$(mktemp -d)
-FILES=(backend/fancore.py backend/ktheme.py backend/sysmon.py juno-fancontrol-apply fan-profile fan-calibrate app.py fancurve.py tray.py)
+FILES=(backend/fancore.py backend/ktheme.py backend/sysmon.py juno-fancontrol-apply fan-profile fan-calibrate app.py fancurve.py tray.py
+       systemd/30-juno-fancontrol.conf debian/install debian/postinst debian/prerm)
 save()    { for f in "${FILES[@]}"; do mkdir -p "$BK/$(dirname "$f")"; cp "$f" "$BK/$f"; done; }
 restore() { find . -name __pycache__ -type d -prune -exec rm -rf {} + ; for f in "${FILES[@]}"; do cp "$BK/$f" "$f"; done; }
 trap 'restore; rm -rf "$BK" "$OUT"; echo "[trap] tree restored"' EXIT
@@ -40,8 +41,30 @@ LIMIT=300
 FIRED=0
 MISSED=0
 
-run() {  # -> "<failed pytest ids> | <failed shell tags>", or HUNG
-    local py sh rc
+syslane() {  # -> space-separated failed static systemd/packaging checks (host-side), or empty
+    # test_deb.sh's matching assertions only run in the container gate, which
+    # the sweep cannot touch; these greps keep the same properties killable
+    # here. Every check below is fired by at least one mutation.
+    local s=""
+    grep -qx 'Restart=on-failure' systemd/30-juno-fancontrol.conf || s+="dropin-restart-policy "
+    grep -q '^Restart=always' systemd/30-juno-fancontrol.conf && s+="dropin-restart-always "
+    grep -qx 'StartLimitIntervalSec=180' systemd/30-juno-fancontrol.conf || s+="dropin-startlimit-interval "
+    grep -qx 'StartLimitBurst=3' systemd/30-juno-fancontrol.conf || s+="dropin-startlimit-burst "
+    grep -q 'systemd/fancontrol-sleep-noop' debian/install || s+="noop-not-shipped "
+    ! grep -q 'systemd/fancontrol-resume' debian/install || s+="resume-hook-still-installed "
+    grep -q 'dpkg-divert --package juno-kde-fancontrol --add' debian/postinst || s+="divert-missing "
+    grep -q 'dpkg-divert --package juno-kde-fancontrol --remove' debian/prerm || s+="undivert-missing "
+    grep -q 'ovr=(/etc/systemd/system/fancontrol.service.d/\*\.conf)' debian/postinst || s+="etc-dropin-warning-missing "
+    # systemd-sleep executes every non-hidden executable in system-sleep/; the
+    # divert target must stay dot-prefixed or both hooks run on resume.
+    grep -q 'system-sleep/\.fancontrol\.juno-diverted' debian/postinst || s+="divert-target-visible-postinst "
+    grep -q 'system-sleep/\.fancontrol\.juno-diverted' debian/prerm || s+="divert-target-visible-prerm "
+    grep -q 'install -m 755 "$SLP_NOOP" "$SLP"' debian/postinst || s+="noop-reinstall-missing "
+    echo "${s% }"
+}
+
+run() {  # -> "<failed pytest ids> | <failed shell tags> | <failed systemd checks>", or HUNG
+    local py sh sys rc
     # The whole directory, never a list of files: a named list silently left
     # tests/test_ktheme.py out of this sweep for a whole pass.
     timeout "$LIMIT" python3 -m pytest tests -q -p no:cacheprovider > "$OUT/py" 2>&1
@@ -56,12 +79,14 @@ run() {  # -> "<failed pytest ids> | <failed shell tags>", or HUNG
     # spec (T15-reject[45:0]) and two distinct cases printed identically.
     sh=$(grep '^FAIL ' "$OUT/sh" | sed 's/^FAIL //;s/: .*//' | tr '\n' ' ')
 
-    echo "${py:-none} | ${sh:-none}"
+    sys=$(syslane)
+
+    echo "${py:-none} | ${sh:-none} | ${sys:-none}"
 }
 
 base=$(run)
 echo "== baseline: $base"
-if [[ "$base" != "none | none" ]]; then
+if [[ "$base" != "none | none | none" ]]; then
     echo "BASELINE IS NOT GREEN -- refusing to attribute any failure to a mutation"
     exit 1
 fi
@@ -75,7 +100,7 @@ mutate() { # mutate NAME FILE SED_EXPR
     fi
     local r; r=$(run)
     printf '  %-28s %s\n' "$1:" "$r"
-    if [[ "$r" == "none | none" ]]; then MISSED=$((MISSED+1)); else FIRED=$((FIRED+1)); fi
+    if [[ "$r" == "none | none | none" ]]; then MISSED=$((MISSED+1)); else FIRED=$((FIRED+1)); fi
 }
 
 pymutate() { # pymutate NAME FILE OLD NEW  -- for edits sed cannot express
@@ -90,10 +115,10 @@ p.write_text(s.replace(old, new, 1))
 EOF
     local r; r=$(run)
     printf '  %-28s %s\n' "$1:" "$r"
-    if [[ "$r" == "none | none" ]]; then MISSED=$((MISSED+1)); else FIRED=$((FIRED+1)); fi
+    if [[ "$r" == "none | none | none" ]]; then MISSED=$((MISSED+1)); else FIRED=$((FIRED+1)); fi
 }
 
-echo "== mutations (each line: failing pytest ids | failing shell tags)"
+echo "== mutations (each line: failing pytest ids | failing shell tags | failed systemd checks)"
 mutate M1-knob-slope backend/fancore.py \
     's|(temp_c - t0) \* (p1 - p0) // (t1 - t0) + p0|(temp_c - t0) * (p1 - p0) // (t1 - t0 + 1) + p0|'
 mutate M2-drop-bang-source backend/fancore.py \
@@ -268,6 +293,60 @@ pymutate M38-render-collapses-gpu-band backend/fancore.py \
 # behaviour; it exits 1 and leaves the cap written but the curve in place.
 mutate M39-calibrate-custom-dies fan-calibrate \
     's|priv env NO_RESTART=1 fan-profile regen|priv fan-profile "$cur"|'
+
+# --- restart hygiene (every fancontrol start blips 255 onto each pwm) ---
+# Unit policy: the crash loop cap and on-failure restart live in the drop-in,
+# guarded by the sweep's systemd lane (the container gate checks the same).
+mutate M44-restart-always-back systemd/30-juno-fancontrol.conf \
+    's|^Restart=on-failure$|Restart=always|'
+mutate M45-startlimit-dropped systemd/30-juno-fancontrol.conf \
+    '/^StartLimitBurst=3$/d'
+mutate M57-startlimit-interval-dropped systemd/30-juno-fancontrol.conf \
+    '/^StartLimitIntervalSec=180$/d'
+# Packaging: the no-op hook must ship, the old resume hook must not come back,
+# and the diversion must be addable, removable and warned about.
+mutate M46-noop-not-shipped debian/install \
+    '/fancontrol-sleep-noop/d'
+pymutate M47-resume-hook-back debian/install \
+    'systemd/fancontrol-sleep-noop usr/share/juno-kde-fancontrol/' \
+    'systemd/fancontrol-sleep-noop usr/share/juno-kde-fancontrol/
+systemd/fancontrol-resume usr/lib/systemd/system-sleep/'
+mutate M48-divert-dropped debian/postinst \
+    's|dpkg-divert --package juno-kde-fancontrol --add --rename|true|'
+mutate M49-undivert-dropped debian/prerm \
+    '/dpkg-divert --package juno-kde-fancontrol --remove/d'
+mutate M50-etc-dropin-warning-dropped debian/postinst \
+    '/ovr=(\/etc/d'
+# Restart-only-on-change: a broken timestamp exclusion restarts on every
+# minute crossing; a dropped skip restarts on every re-apply; a dropped
+# is-active leaves a down daemon down.
+pymutate M51-stamp-not-excluded fan-profile \
+    '    cmp -s <(sed '"'"'1s/ — .*//'"'"' "$1") <(sed '"'"'1s/ — .*//'"'"' "$2")' \
+    '    cmp -s "$1" <(sed '"'"'1s/ — .*//'"'"' "$2")'
+pymutate M52-helper-always-restarts juno-fancontrol-apply \
+    '    if "$SYSTEMCTL" is-active --quiet fancontrol.service && cfg_eq "$TMP" "$FANCONFIG"; then' \
+    '    if false && "$SYSTEMCTL" is-active --quiet fancontrol.service && cfg_eq "$TMP" "$FANCONFIG"; then'
+pymutate M53-cli-always-restarts fan-profile \
+    '    if systemctl is-active --quiet fancontrol.service && cfg_eq "$tmp" "$FANCONFIG"; then' \
+    '    if false && systemctl is-active --quiet fancontrol.service && cfg_eq "$tmp" "$FANCONFIG"; then'
+pymutate M54-calibrate-always-restarts fan-calibrate \
+    "            pre=\$(sed '1s/ — .*//' \"\$FANCONFIG\" 2>/dev/null || true)" \
+    '            pre=mutant-never-matches'
+mutate M55-calibrate-never-restarts fan-calibrate \
+    's|priv "$SYSTEMCTL" restart fancontrol.service|priv "$SYSTEMCTL" try-restart fancontrol.service|'
+pymutate M56-helper-inactive-left-down juno-fancontrol-apply \
+    '    if "$SYSTEMCTL" is-active --quiet fancontrol.service && cfg_eq "$TMP" "$FANCONFIG"; then' \
+    '    if cfg_eq "$TMP" "$FANCONFIG"; then'
+# Dropping the dot from the divert target puts the original hook back in
+# systemd-sleep's scan: both hooks would run on every resume.
+mutate M58-divert-target-visible-postinst debian/postinst \
+    's|system-sleep/\.fancontrol\.juno-diverted|system-sleep/fancontrol.juno-diverted|'
+mutate M59-divert-target-visible-prerm debian/prerm \
+    's|system-sleep/\.fancontrol\.juno-diverted|system-sleep/fancontrol.juno-diverted|'
+# Without the reinstall line a rewritten hook stays rewritten until the next
+# upgrade: the no-op is only ever placed once.
+mutate M60-noop-reinstall-dropped debian/postinst \
+    '/install -m 755 "$SLP_NOOP" "$SLP"/d'
 
 restore
 echo "== after restore: $(run)"

@@ -158,8 +158,17 @@ if [[ "$APPLY" == "1" ]]; then
             # custom is not in the preset table: replaying it through the table
             # would flatten a knob curve or a dual band. regen keeps the on-disk
             # curve and re-caps it; the restart picks the re-capped config up.
+            # Line 1's stamp is minute-grain wall clock, not curve content —
+            # strip it before comparing (same rule as fan-profile/juno-fancontrol-apply).
+            pre=$(sed '1s/ — .*//' "$FANCONFIG" 2>/dev/null || true)
             priv env NO_RESTART=1 fan-profile regen
-            priv "$SYSTEMCTL" restart fancontrol.service ;;
+            if ! priv "$SYSTEMCTL" is-active --quiet fancontrol.service; then
+                priv "$SYSTEMCTL" start fancontrol.service
+            elif [[ "$pre" == "$(sed '1s/ — .*//' "$FANCONFIG")" ]]; then
+                echo "fan-calibrate: cap changed nothing in $FANCONFIG; fancontrol.service already running — restart skipped"
+            else
+                priv "$SYSTEMCTL" restart fancontrol.service
+            fi ;;
     esac
 else
     echo "Re-run with --apply to write the cap and re-apply your profile."
