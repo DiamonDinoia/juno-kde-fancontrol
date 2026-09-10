@@ -110,31 +110,34 @@ EOF
     apt-get update -qq -o APT::Update::Error-Mode=any
 }
 
-# juno-drivers-diamon and clevo-keyboard-dkms are not published yet (their own
-# CI is running); the harness stages the diamon10 debs it just built locally
-# at /out/cycle. ec-sys-dkms already has a published `builds` release asset,
-# fetched here by creation time since version strings do not sort lexically
-# (diamon10 < diamon2 as strings).
+# The three siblings of the Depends cycle come from their repos' `builds`
+# release, newest asset by creation time: version strings do not sort
+# lexically (diamon10 < diamon2 as strings).
 CYCLE=$(mktemp -d)
-cp /out/cycle/*.deb "$CYCLE"/ 2>/dev/null
-ec_name=$("$PYTHON" - "$CYCLE" <<'PYEOF'
+cycle_names=$("$PYTHON" - "$CYCLE" <<'PYEOF'
 import json, sys, urllib.request
-req = urllib.request.Request(
-    "https://api.github.com/repos/DiamonDinoia/ec-sys-dkms/releases/tags/builds",
-    headers={"Accept": "application/vnd.github+json", "User-Agent": "test-deb"})
-rel = json.load(urllib.request.urlopen(req, timeout=30))
-assets = sorted(
-    (a for a in rel["assets"] if a["name"].startswith("ec-sys-dkms_") and a["name"].endswith("_amd64.deb")),
-    key=lambda a: a["created_at"])
-if not assets:
-    sys.exit(1)
-best = assets[-1]
-urllib.request.urlretrieve(best["browser_download_url"], sys.argv[1] + "/" + best["name"])
-print(best["name"])
+want = [("juno-drivers-debian", "juno-drivers-diamon_"),
+        ("juno-drivers-debian", "clevo-keyboard-dkms_"),
+        ("ec-sys-dkms", "ec-sys-dkms_")]
+rels = {}
+for repo, prefix in want:
+    if repo not in rels:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/DiamonDinoia/{repo}/releases/tags/builds",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "test-deb"})
+        rels[repo] = json.load(urllib.request.urlopen(req, timeout=30))["assets"]
+    assets = sorted(
+        (a for a in rels[repo] if a["name"].startswith(prefix) and a["name"].endswith("_amd64.deb")),
+        key=lambda a: a["created_at"])
+    if not assets:
+        sys.exit(1)
+    best = assets[-1]
+    urllib.request.urlretrieve(best["browser_download_url"], sys.argv[1] + "/" + best["name"])
+    print(best["name"])
 PYEOF
 )
 n_cycle=$(ls "$CYCLE"/*.deb 2>/dev/null | wc -l)
-[[ -n "$ec_name" && "$n_cycle" -eq 3 ]] && ok cycle-siblings-fetched \
+[[ -n "$cycle_names" && "$n_cycle" -eq 3 ]] && ok cycle-siblings-fetched \
     || bad cycle-siblings-fetched "expected 3 sibling debs (juno-drivers-diamon, clevo-keyboard-dkms, ec-sys-dkms), got $n_cycle: $(ls "$CYCLE" 2>&1)"
 
 # --- install + verify (real apt resolution on Debian unstable) -------------------
