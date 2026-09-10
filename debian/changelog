@@ -1,3 +1,22 @@
+juno-kde-fancontrol (0.6.3+diamon3) unstable; urgency=low
+
+  * Fix the ordering cycle that silently dropped fancontrol.service's start
+    and stop jobs. The drop-in's Before=basic.target, combined with the base
+    unit's After=lm-sensors.service and lm-sensors.service's own implicit
+    After=basic.target, formed fancontrol.service/start after
+    lm-sensors.service/start after basic.target/start - after
+    fancontrol.service/start; systemd deleted the job to break it every boot,
+    so fans ran the EC's auto curve until started by hand, and got no SIGTERM
+    at shutdown (killed unordered instead, bypassing the pwmdisable trap and
+    freezing pwm at whatever duty was live). Drop-ins cannot reset
+    After=lm-sensors.service (dependency directives only accumulate, see
+    systemd.unit(5) Example 2), so the fix removes Before=basic.target
+    instead: the one edge the drop-in adds itself. fancontrol.service now
+    starts and stops on the stock DefaultDependencies=yes ordering, at the
+    normal multi-user.target point rather than at POST.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Thu, 10 Sep 2026 04:35:00 -0400
+
 juno-kde-fancontrol (0.6.3+diamon2) unstable; urgency=low
 
   * Reap the stale source-install resume hook: install.sh ≤0.6.2 wrote
