@@ -130,19 +130,20 @@ sys.stdout.write(render_config(c, hw, "2026-08-31 07:35"))
 PYEOF
 }
 
-# T1: preset label => the on-disk result IS the preset table (regen replays it
-# at restart — this test pins that contract). quiet table maxpwm is 120, so the
-# helper's 255 arg is clamp-reported but the table wins after the restart replay.
+# T1: preset label => the restart replay (regen) keeps the file the helper
+# actually wrote, clamp included -- regen re-derives nothing, it only
+# refreshes hwmon indices. The helper's 255 arg is clamped to the cap (150)
+# at write time; that 150 is what must still be on disk after the replay.
 make_tree 2; reset_state
 out=$("$APPLY" 10 60 95 70 50 0 255 4 quiet 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok T1-apply || bad T1-apply "$out"
 [[ -f $ROOT/etc/fancontrol ]] || bad T1-config-missing ""
-render_ref 120 > "$ROOT/ref.txt"
+render_ref 150 > "$ROOT/ref.txt"
 # line 1 carries a wall-clock date from fan-profile's regen replay: compare the rest
 if diff -q <(tail -n +2 "$ROOT/ref.txt") <(tail -n +2 "$ROOT/etc/fancontrol") >/dev/null 2>&1; then
-    ok T1-table-parity
+    ok T1-regen-keeps-clamp
 else
-    bad T1-table-parity "$(diff -u <(tail -n +2 "$ROOT/ref.txt") <(tail -n +2 "$ROOT/etc/fancontrol") 2>&1 | head -20)"
+    bad T1-regen-keeps-clamp "$(diff -u <(tail -n +2 "$ROOT/ref.txt") <(tail -n +2 "$ROOT/etc/fancontrol") 2>&1 | head -20)"
 fi
 grep -q "restart fancontrol.service" "$ROOT/state/systemctl.log" && ok T1-restarted || bad T1-restarted ""
 grep -q "enable fancontrol.service"  "$ROOT/state/systemctl.log" && ok T1-enabled   || bad T1-enabled ""
@@ -659,7 +660,11 @@ grep -qx "MAXPWM=hwmon7/pwm1=150 hwmon7/pwm2=120" "$ROOT/etc/fancontrol" \
     || bad T22f-cap-clamps-cpu-only "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
 
 # T22g: fan-calibrate --apply on a 'custom' label routes to regen instead of
-# dying: the on-disk curve keeps both bands and the new cap lands on each.
+# dying: the on-disk curve (both bands) is untouched by the new cap. Clamping
+# is an apply-time decision already made when the file was written, and regen
+# never re-derives it -- a lower cap takes effect on the NEXT explicit apply,
+# not retroactively on the curve already on disk (the same rule that keeps a
+# --ignore-cap MAXPWM from being silently re-clamped on every daemon restart).
 mkdir -p "$ROOT/bin/fc"
 cat > "$ROOT/bin/fc/fan-profile" <<EOF
 #!/bin/bash
@@ -675,15 +680,30 @@ out=$(env PATH="$ROOT/bin/fc:$ROOT/bin:$PATH" FC_AS_ROOT=1 FC_TEST_CAP=100 \
 grep -qx "MINTEMP=hwmon7/pwm1=60 hwmon7/pwm2=40" "$ROOT/etc/fancontrol" \
     && ok T22g-calibrate-keeps-bands \
     || bad T22g-calibrate-keeps-bands "$(grep '^MINTEMP=' "$ROOT/etc/fancontrol")"
-grep -qx "MAXPWM=hwmon7/pwm1=100 hwmon7/pwm2=100" "$ROOT/etc/fancontrol" \
-    && ok T22g-calibrate-recaps-both-bands \
-    || bad T22g-calibrate-recaps-both-bands "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
+grep -qx "MAXPWM=hwmon7/pwm1=100 hwmon7/pwm2=120" "$ROOT/etc/fancontrol" \
+    && ok T22g-calibrate-does-not-reclamp \
+    || bad T22g-calibrate-does-not-reclamp "$(grep '^MAXPWM=' "$ROOT/etc/fancontrol")"
 [[ "$(cat "$ROOT/etc/fan-profile.maxpwm")" == "100" ]] \
     && ok T22g-cap-written || bad T22g-cap-written "$(cat "$ROOT/etc/fan-profile.maxpwm")"
-# the re-cap changed MAXPWM (120 -> 100), so the daemon must restart, once
+# regen re-emits byte-identical curve content (only the cap FILE changed, not
+# the curve), so the daemon must not restart for nothing.
+[[ "$(grep -c '^restart fancontrol.service$' "$ROOT/state/systemctl.log")" == 0 ]] \
+    && ok T22g-unchanged-skips-restart \
+    || bad T22g-unchanged-skips-restart "$(cat "$ROOT/state/systemctl.log")"
+
+# T22g-drift: an index drift IS a real content change (FCTEMPS gets a fresh
+# hwmon number), so calibrate's regen must restart -- and must use a real
+# restart, not a conditional one that silently no-ops on an inactive unit.
+mv "$ROOT/sys/clevofan/hwmon/hwmon7" "$ROOT/sys/clevofan/hwmon/hwmon4"
+: > "$ROOT/state/systemctl.log"
+out=$(env PATH="$ROOT/bin/fc:$ROOT/bin:$PATH" FC_AS_ROOT=1 FC_TEST_CAP=100 \
+         FC_CAP_FILE="$ROOT/etc/fan-profile.maxpwm" FC_FANCONFIG="$ROOT/etc/fancontrol" \
+         FC_SYSTEMCTL="$ROOT/bin/systemctl" bash "$SRC/fan-calibrate" --apply 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok T22g-drift-calibrate || bad T22g-drift-calibrate "rc=$rc $out"
 [[ "$(grep -c '^restart fancontrol.service$' "$ROOT/state/systemctl.log")" == 1 ]] \
-    && ok T22g-change-restarts-once \
-    || bad T22g-change-restarts-once "$(cat "$ROOT/state/systemctl.log")"
+    && ok T22g-drift-restarts-once \
+    || bad T22g-drift-restarts-once "$(cat "$ROOT/state/systemctl.log")"
+mv "$ROOT/sys/clevofan/hwmon/hwmon4" "$ROOT/sys/clevofan/hwmon/hwmon7"
 echo 150 > "$ROOT/etc/fan-profile.maxpwm"
 
 # T22h: same routing keeps a knob config a knob config (both lines carried and

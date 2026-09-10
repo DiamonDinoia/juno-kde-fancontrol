@@ -134,8 +134,14 @@ mutate M3-step-above-mintemp backend/fancore.py \
     's|k.append((self.mintemp - 1, self.minpwm))|k.append((self.mintemp + 1, self.minpwm))|'
 mutate M4-drop-falling-check juno-fancontrol-apply \
     '/knob pwm must not fall/d'
+# The KNOB_CPU guard this mutation used to target (apply_fancontrol's own
+# clamp=0 for knob mode) is now unreachable dead code: regen_custom is the
+# only caller that can ever see a non-empty KNOB_CPU, and it passes clamp=0
+# explicitly below. Target the real guard instead: drop it and a plain custom
+# curve's MAXPWM gets re-clamped to the cap on every restart (T2-ignore-cap,
+# T-regen-preserve(b)).
 mutate M5-regen-clamps-xfer fan-profile \
-    '/\[\[ -n "$KNOB_CPU" \]\] && clamp=0/d'
+    's|apply_fancontrol "\$interval" "\$mintemp" "\$maxtemp" "\$minstart" "\$minstop" "\$minpwm" "\$maxpwm" 0|apply_fancontrol "$interval" "$mintemp" "$maxtemp" "$minstart" "$minstop" "$minpwm" "$maxpwm"|'
 mutate M6-drop-insert-clamp app.py \
     's|k\[i\] = (t, max(lo, min(pwm, hi)))|k[i] = (t, pwm)|'
 mutate M7-regen-loses-bang fan-profile \
@@ -337,8 +343,8 @@ pymutate M53-cli-always-restarts fan-profile \
     '    if systemctl is-active --quiet fancontrol.service && cfg_eq "$tmp" "$FANCONFIG"; then' \
     '    if false && systemctl is-active --quiet fancontrol.service && cfg_eq "$tmp" "$FANCONFIG"; then'
 pymutate M54-calibrate-always-restarts fan-calibrate \
-    "            pre=\$(sed '1s/ — .*//' \"\$FANCONFIG\" 2>/dev/null || true)" \
-    '            pre=mutant-never-matches'
+    "    pre=\$(sed '1s/ — .*//' \"\$FANCONFIG\" 2>/dev/null || true)" \
+    '    pre=mutant-never-matches'
 mutate M55-calibrate-never-restarts fan-calibrate \
     's|priv "$SYSTEMCTL" restart fancontrol.service|priv "$SYSTEMCTL" try-restart fancontrol.service|'
 pymutate M56-helper-inactive-left-down juno-fancontrol-apply \

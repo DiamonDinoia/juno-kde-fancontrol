@@ -34,6 +34,7 @@ check installsh-lane bash -c 'cd /tmp && bash /src/install.sh >/dev/null && test
 # tests/test_ktheme.py out of the gate for a whole pass.
 check fancore-unit      "$PYTHON" -m pytest -q -p no:cacheprovider "$SRC/tests"
 check apply-helper      env PYTHON="$PYTHON" bash "$SRC/tests/test_apply_helper.sh"
+check regen-preserve    bash "$SRC/tests/test_regen_preserve.sh"
 check deb-package       bash "$SRC/tests/test_deb.sh"
 check ksystemstats      bash "$SRC/tests/test_ksystemstats.sh"
 check render-quiet      "$PYTHON" "$SRC/tests/render_app.py" --out /out/shot-quiet.png       --preset quiet

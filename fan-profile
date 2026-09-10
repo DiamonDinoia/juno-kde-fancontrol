@@ -23,7 +23,8 @@ NOW="${FP_NOW:-$(date '+%Y-%m-%d %H:%M')}"
 # hwmon indices are NOT stable across reboots, and fancontrol matches devices
 # by the literal hwmonN index (ValidateDevices, not by name). So resolve the
 # current index for each device fresh on every run and write THOSE into the
-# config. `regen` below re-runs this at boot via an ExecStartPre drop-in.
+# config. `regen` below re-runs this on every fancontrol.service start (not
+# just boot) via an ExecStartPre drop-in.
 resolve_hw() {
     local d
     d=$(ls -d "$SYSFS/$1"/hwmon/hwmon* 2>/dev/null | head -1) || true
@@ -110,8 +111,8 @@ Usage: fan-profile {quiet|balanced|cool|turbo|auto|status|regen}
   turbo     aggressive, reaches full speed — ignores noise cap     (fancontrol)
   auto      hand the fan to the EC firmware curve, stop daemon     (EC)
   status    show backend, pwm mode, temps, fan RPM, noise cap      (no sudo)
-  regen     rewrite config for current hwmon indices, no restart   (boot hook;
-            custom labels and knob curves keep their on-disk values)
+  regen     rewrite config for current hwmon indices, no restart   (runs on
+            every unit start; all labels keep their on-disk MIN/MAX/cap)
 
 Non-turbo profiles are clamped to the calibrated cap in $CAP_FILE if present.
 Run 'fan-calibrate --apply' to measure and set that cap from the mic.
@@ -207,7 +208,7 @@ apply_fancontrol() {
             (( gv[5] <= cap )) || { gv[5]="$cap"; BAND_GPU="${gv[*]}"; }
         fi
     fi
-    # regen (boot ExecStartPre) only rewrites the file; touching systemctl here
+    # regen (every-start ExecStartPre) only rewrites the file; touching systemctl here
     # would recurse into the unit that is currently starting us.
     if [[ "${NO_RESTART:-0}" == "1" ]]; then
         write_curve "$FANCONFIG" "$1" "$2" "$3" "$4" "$5" "$6" "$maxpwm"
@@ -300,9 +301,11 @@ cap_knobs() {
     [[ -z "$KNOB_GPU" ]] || KNOB_GPU=$(cap_line "$KNOB_GPU" "$cap")
 }
 
-# regen for a custom label (written by juno-kde-fancontrol): re-emit the
-# on-disk curve values with freshly-resolved hwmon indices, keeping the label
-# and, on a dual-band config, BOTH bands.
+# regen for any label (preset or custom, written by fan-profile or
+# juno-kde-fancontrol): re-emit the on-disk curve values with freshly-resolved
+# hwmon indices, keeping the label, the on-disk MIN/MAX (no re-clamp — the cap
+# was already applied whenever this file was last written), and, on a
+# dual-band config, BOTH bands.
 regen_custom() {
     local interval mintemp maxtemp minstart minstop minpwm maxpwm average v
     local gmintemp gmaxtemp gminstart gminstop gminpwm gmaxpwm
@@ -335,7 +338,7 @@ regen_custom() {
     # accepts and then reads as 0 at runtime (no kick-start pulse).
     for v in "$interval" "$mintemp" "$maxtemp" "$minstart" "$minstop" "$minpwm" "$maxpwm"; do
         if [[ ! "$v" =~ ^[0-9]+$ ]]; then
-            # Never fail the boot ExecStartPre: leave the file for fancontrol
+            # Never fail the regen ExecStartPre: leave the file for fancontrol
             # --check (the next ExecStartPre) to arbitrate.
             echo "fan-profile regen: cannot parse values in $FANCONFIG, left untouched" >&2
             exit 0
@@ -361,7 +364,10 @@ regen_custom() {
            "$mintemp $maxtemp $minstart $minstop $minpwm $maxpwm" ]] &&
             BAND_GPU="$gmintemp $gmaxtemp $gminstart $gminstop $gminpwm $gmaxpwm"
     fi
-    apply_fancontrol "$interval" "$mintemp" "$maxtemp" "$minstart" "$minstop" "$minpwm" "$maxpwm"
+    # clamp=0: the on-disk MAXPWM already reflects whatever cap was in effect
+    # when this file was last written (by fan-profile or fancore.render_config).
+    # regen only refreshes hwmon indices, it must not re-derive a clamp decision.
+    apply_fancontrol "$interval" "$mintemp" "$maxtemp" "$minstart" "$minstop" "$minpwm" "$maxpwm" 0
     # write_curve hardcodes AVERAGE=4; restore a custom value (per-pwm
     # replacement — a greedy match would only rewrite the last entry).
     if [[ "$average" =~ ^[0-9]+$ ]] && (( average >= 1 && average <= 16 && average != 4 )); then
@@ -370,18 +376,19 @@ regen_custom() {
 }
 
 # regen: re-emit the currently-active profile with freshly-resolved hwmon
-# indices, without restarting the unit. Used as a boot-time ExecStartPre so the
-# config always matches this boot's hwmon numbering.
+# indices, without restarting the unit. Runs as an ExecStartPre on every start
+# and restart of fancontrol.service (not only at boot), so it must never
+# derive a curve from the preset table — the table has no MIN/MAX values on
+# disk to lose, but every label's on-disk file does, including a hand-edited
+# preset. regen_custom re-emits exactly what is on disk for every label.
 if [[ "$PROFILE" == "regen" ]]; then
     NO_RESTART=1
     PROFILE=$(grep -m1 '^# Managed by fan-profile' "$FANCONFIG" 2>/dev/null | sed 's/.*(//; s/).*//') || true
     [[ -n "${PROFILE:-}" ]] || PROFILE=quiet
     # auto has no fancontrol curve to write; nothing to resync.
     [[ "$PROFILE" == "auto" ]] && exit 0
-    case "$PROFILE" in
-        quiet|balanced|cool|turbo) ;;  # replayed from the table below
-        *) regen_custom; exit $? ;;    # custom label: keep values, fresh indices
-    esac
+    regen_custom
+    exit $?
 fi
 
 case "$PROFILE" in
