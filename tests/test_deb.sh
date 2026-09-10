@@ -115,7 +115,11 @@ EOF
 # lexically (diamon10 < diamon2 as strings).
 CYCLE=$(mktemp -d)
 cycle_names=$("$PYTHON" - "$CYCLE" <<'PYEOF'
-import json, sys, urllib.request
+import json, os, sys, urllib.error, urllib.request
+# Unauthenticated GitHub API calls are capped at 60/h per IP; CI passes GH_TOKEN.
+headers = {"Accept": "application/vnd.github+json", "User-Agent": "test-deb"}
+if os.environ.get("GH_TOKEN"):
+    headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
 want = [("juno-drivers-debian", "juno-drivers-diamon_"),
         ("juno-drivers-debian", "clevo-keyboard-dkms_"),
         ("ec-sys-dkms", "ec-sys-dkms_")]
@@ -123,14 +127,16 @@ rels = {}
 for repo, prefix in want:
     if repo not in rels:
         req = urllib.request.Request(
-            f"https://api.github.com/repos/DiamonDinoia/{repo}/releases/tags/builds",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "test-deb"})
-        rels[repo] = json.load(urllib.request.urlopen(req, timeout=30))["assets"]
+            f"https://api.github.com/repos/DiamonDinoia/{repo}/releases/tags/builds", headers=headers)
+        try:
+            rels[repo] = json.load(urllib.request.urlopen(req, timeout=30))["assets"]
+        except urllib.error.HTTPError as e:
+            sys.exit(f"{repo} builds release: HTTP {e.code} {e.reason}")
     assets = sorted(
         (a for a in rels[repo] if a["name"].startswith(prefix) and a["name"].endswith("_amd64.deb")),
         key=lambda a: a["created_at"])
     if not assets:
-        sys.exit(1)
+        sys.exit(f"{repo} builds release has no {prefix}*_amd64.deb asset")
     best = assets[-1]
     urllib.request.urlretrieve(best["browser_download_url"], sys.argv[1] + "/" + best["name"])
     print(best["name"])

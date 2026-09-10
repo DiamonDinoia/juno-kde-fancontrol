@@ -16,5 +16,6 @@ podman run --rm \
     -v "$REPO_ROOT:/src:ro" \
     -v "$OUT:/out" \
     -e FANPROFILE=/src/fan-profile \
+    -e GH_TOKEN \
     "$IMAGE" bash /src/tests/container-entry.sh
 echo "screenshots in $OUT; deb in $OUT/deb/"
