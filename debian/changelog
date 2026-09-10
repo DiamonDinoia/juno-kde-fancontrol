@@ -1,3 +1,15 @@
+juno-kde-fancontrol (0.6.3+diamon4) unstable; urgency=low
+
+  * Depends: juno-drivers-diamon. Closes the 4-way Juno Depends cycle together
+    with juno-drivers-diamon, clevo-keyboard-dkms and ec-sys-dkms, so
+    installing any one of the four pulls in the rest. No maintainer script
+    here references another package by name, so the cycle stays
+    install-order-safe (Debian Policy 7.2). tests/test_deb.sh gains a check
+    that the built deb alone is uninstallable (unmet juno-drivers-diamon) and
+    that all four together configure and report ii.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Thu, 10 Sep 2026 11:10:00 -0400
+
 juno-kde-fancontrol (0.6.3+diamon3) unstable; urgency=low
 
   * Fix the ordering cycle that silently dropped fancontrol.service's start

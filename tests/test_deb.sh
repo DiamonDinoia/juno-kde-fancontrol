@@ -16,7 +16,7 @@ export DEBIAN_FRONTEND=noninteractive
 # dpkg-checkbuilddeps names any miss loudly; this list cannot drift silently.
 apt-get install -y -qq --no-install-recommends dpkg-dev debhelper fakeroot build-essential \
     cmake extra-cmake-modules qt6-base-dev libkf6coreaddons-dev libkf6i18n-dev \
-    libksysguard-dev libsensors-dev >/tmp/apt.deb.log 2>&1 \
+    libksysguard-dev libsensors-dev curl ca-certificates >/tmp/apt.deb.log 2>&1 \
     || { echo "apt install failed:"; tail -5 /tmp/apt.deb.log; exit 1; }
 
 # --- build (in a scratch copy: a build must not dirty the source mount) ------
@@ -76,6 +76,67 @@ dpkg-deb -f "$DEB" Depends | grep -q ksystemstats  && ok dep-ksystemstats || bad
 dpkg-deb -f "$DEB" Depends | grep -q libksysguardsystemstats2 && ok dep-shlibs-resolved \
     || bad dep-shlibs-resolved "shlibdeps did not pick up the plugin's lib"
 
+# --- 4-way Juno Depends cycle ---------------------------------------------------
+# juno-kde-fancontrol Depends: juno-drivers-diamon (0.6.3+diamon4), closing the
+# cycle with juno-drivers-diamon, clevo-keyboard-dkms and ec-sys-dkms: installing
+# any one of the four must pull in the rest. Proven two ways below: the built
+# deb alone must fail to install (unmet juno-drivers-diamon), and all four
+# together must configure and report ii.
+if apt-get install -y --no-install-recommends "$DEB" </dev/null >/tmp/lone.log 2>&1; then
+    bad cycle-lone-fails "installed standalone, without juno-drivers-diamon"
+else
+    grep -qi juno-drivers-diamon /tmp/lone.log && ok cycle-lone-fails \
+        || bad cycle-lone-fails "failed for a reason other than juno-drivers-diamon: $(tail -8 /tmp/lone.log)"
+fi
+apt-get -f install -y -qq </dev/null >/dev/null 2>&1 || true
+
+# juno-drivers-diamon Depends pull in hfsprogs, unrar, 7zip-rar, intel/amd64
+# microcode and friends, which sit outside main.
+sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' \
+    /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+apt-get update -qq
+
+# juno-drivers-diamon Depends: juno-info, which only Juno's own repo publishes.
+JUNO_KEY_SHA=06347ea57cf8ce6c96cf673f32a34cd6a520c0a0b5aef5db393702072f598901
+dpkg-query -W -f '${Status}' juno-archive-keyring 2>/dev/null | grep -q 'install ok installed' || {
+    curl -fsSL https://deb.junocomputers.com/gpg.key -o /etc/apt/keyrings/juno-repo.asc
+    echo "$JUNO_KEY_SHA  /etc/apt/keyrings/juno-repo.asc" | sha256sum -c - >/dev/null
+    cat > /etc/apt/sources.list.d/juno-repo.sources <<EOF
+Types: deb
+URIs: https://deb.junocomputers.com/
+Suites: /
+Signed-By: /etc/apt/keyrings/juno-repo.asc
+EOF
+    apt-get update -qq -o APT::Update::Error-Mode=any
+}
+
+# juno-drivers-diamon and clevo-keyboard-dkms are not published yet (their own
+# CI is running); the harness stages the diamon10 debs it just built locally
+# at /out/cycle. ec-sys-dkms already has a published `builds` release asset,
+# fetched here by creation time since version strings do not sort lexically
+# (diamon10 < diamon2 as strings).
+CYCLE=$(mktemp -d)
+cp /out/cycle/*.deb "$CYCLE"/ 2>/dev/null
+ec_name=$("$PYTHON" - "$CYCLE" <<'PYEOF'
+import json, sys, urllib.request
+req = urllib.request.Request(
+    "https://api.github.com/repos/DiamonDinoia/ec-sys-dkms/releases/tags/builds",
+    headers={"Accept": "application/vnd.github+json", "User-Agent": "test-deb"})
+rel = json.load(urllib.request.urlopen(req, timeout=30))
+assets = sorted(
+    (a for a in rel["assets"] if a["name"].startswith("ec-sys-dkms_") and a["name"].endswith("_amd64.deb")),
+    key=lambda a: a["created_at"])
+if not assets:
+    sys.exit(1)
+best = assets[-1]
+urllib.request.urlretrieve(best["browser_download_url"], sys.argv[1] + "/" + best["name"])
+print(best["name"])
+PYEOF
+)
+n_cycle=$(ls "$CYCLE"/*.deb 2>/dev/null | wc -l)
+[[ -n "$ec_name" && "$n_cycle" -eq 3 ]] && ok cycle-siblings-fetched \
+    || bad cycle-siblings-fetched "expected 3 sibling debs (juno-drivers-diamon, clevo-keyboard-dkms, ec-sys-dkms), got $n_cycle: $(ls "$CYCLE" 2>&1)"
+
 # --- install + verify (real apt resolution on Debian unstable) -------------------
 # --no-install-recommends: the Recommends are fan-calibrate's audio stack,
 # which nothing in this gate exercises and which costs minutes to fetch.
@@ -83,11 +144,18 @@ dpkg-deb -f "$DEB" Depends | grep -q libksysguardsystemstats2 && ok dep-shlibs-r
 # dpkg; postinst's rm must take it out on install (created after install.sh
 # ran, so the source lane cannot be the remover).
 printf '#!/bin/bash\nexit 0\n' > /usr/lib/systemd/system-sleep/fancontrol-resume
-if apt-get install -y -qq --no-install-recommends "$DEB" > /tmp/deb-install.log 2>&1; then
+if apt-get install -y -qq --no-install-recommends "$DEB" "$CYCLE"/*.deb > /tmp/deb-install.log 2>&1; then
     ok deb-install
 else
     bad deb-install "$(tail -8 /tmp/deb-install.log)"
 fi
+for pkg in juno-drivers-diamon clevo-keyboard-dkms juno-kde-fancontrol ec-sys-dkms; do
+    st=$(dpkg-query -W -f '${db:Status-Abbrev}' "$pkg" 2>/dev/null || true)
+    case "$st" in
+        ii*) ok "cycle-installed:$pkg" ;;
+        *)   bad "cycle-installed:$pkg" "dpkg state '$st', not ii" ;;
+    esac
+done
 [[ ! -e /usr/lib/systemd/system-sleep/fancontrol-resume ]] \
     && ok resume-hook-stale-removed || bad resume-hook-stale-removed "unowned copy survived install"
 # the /usr/local lane left its drop-in under /etc: postinst must name it —
