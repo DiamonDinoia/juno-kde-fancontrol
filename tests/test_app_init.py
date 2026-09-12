@@ -494,6 +494,34 @@ def test_gpu_knobs_load_from_disk(tmp_path, qapp) -> None:
     assert w.curve_from_editor("gpu").knobs == ((40, 0), (85, 255))
     w.select_fan("gpu")
     assert [t for t, _ in w.canvas.curve.knobs] == [40, 85]
+    # Reload with the GPU fan on the canvas: knob curves take the same slot
+    # route as bands, so both must survive it.
+    w.load_all()
+    assert w.canvas.curve.knobs == ((40, 0), (85, 255))
+    assert w.curves["cpu"].knobs == ((45, 0), (95, 130))
+
+
+def test_reload_on_the_gpu_tab_keeps_the_gpu_curve(tmp_path, qapp, no_modals) -> None:
+    """The reported defect: an apply (or any on-disk change) reloads, and with
+    the GPU fan on the canvas the chart jumped to the CPU curve. The next apply
+    then sent that CPU band back as --gpu-band."""
+    import backend.fancore as fc
+    platform = make_platform(tmp_path / "sys")
+    cpu = fc.Curve(label="custom", mintemp=55, maxtemp=90, minstart=60,
+                   minstop=45, minpwm=40, maxpwm=150)
+    gpu = fc.Curve(label="custom", mintemp=60, maxtemp=95, minstart=70,
+                   minstop=50, minpwm=0, maxpwm=120)
+    w = _knob_window_dgpu(tmp_path, qapp)
+    (tmp_path / "etc" / "fancontrol").write_text(fc.render_config(
+        cpu, fc.discover(str(platform)), "2026-09-12 11:07", dgpu=True,
+        gpu_curve=gpu))
+    w.select_fan("gpu")
+    w.load_all()                       # on_apply_done and the file watch call this
+    assert (w.canvas.curve.mintemp, w.canvas.curve.maxpwm) == (60, 120)
+    assert (w.curves["cpu"].mintemp, w.curves["cpu"].maxpwm) == (55, 150)
+    w.args.no_apply = True             # argv only, no pkexec
+    w.on_apply()
+    assert "--gpu-band 60 95 70 50 0 120" in w.result.text()
 
 
 def test_live_marker_follows_the_selected_fan(tmp_path, qapp) -> None:

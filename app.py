@@ -648,13 +648,19 @@ class MainWindow(QWidget):
             with open(self.args.config, encoding="utf-8") as f:
                 text = f.read()
             current = parse_config(text)
-            if self.dgpu:
-                # pwm2's own band (and knobs): a dual-band config must come
-                # back as the two bands on disk, not pwm1 faned out.
-                self.curves["gpu"] = parse_config(text, GPU_PWM)
-            marked = current.label if current.label in self.presets and \
-                self.curve_matches_preset(current, current.label) else None
-            self.editor_from_curve(current, marked)
+            # pwm2's own band (and knobs): a dual-band config must come back as
+            # the two bands on disk, not pwm1 faned out. Both parses run before
+            # either slot is written, so a malformed pwm2 leaves both alone.
+            gpu = parse_config(text, GPU_PWM) if self.dgpu else None
+            # Each fan's slot takes its own band. editor_from_curve writes the
+            # SELECTED slot, so a reload with the GPU fan on the canvas stored
+            # pwm1's band as the GPU curve: the chart jumped to the CPU curve
+            # and the next apply sent it back as --gpu-band.
+            self.curves["cpu"] = current
+            if gpu is not None:
+                self.curves["gpu"] = gpu
+            shown = self.curves[self.sel]
+            self.editor_from_curve(shown, self._matching_preset(shown))
         except (OSError, ValueError):
             fallback = self.presets.get("quiet", Curve(label="quiet"))
             self.editor_from_curve(fallback, "quiet" if "quiet" in self.presets else None)

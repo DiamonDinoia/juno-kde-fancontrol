@@ -1,3 +1,17 @@
+juno-kde-fancontrol (0.6.3+diamon6) unstable; urgency=medium
+
+  * The settings window keeps the GPU curve on a reload. Every reload wrote
+    the parsed pwm1 band into the SELECTED fan's slot, so with the GPU fan on
+    the canvas the chart jumped to the CPU curve, and the next apply sent that
+    band back as --gpu-band. Both reload triggers hit it: the reload after an
+    apply and the file watch, which fires whenever fancontrol.service restarts
+    and its ExecStartPre regen rewrites /etc/fancontrol. Each fan's slot now
+    takes its own band, both parses run before either slot is written, and the
+    preset badge comes from the band on the canvas for either fan. Checks:
+    test_reload_on_the_gpu_tab_keeps_the_gpu_curve, test_gpu_knobs_load_from_disk.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Sat, 12 Sep 2026 11:13:00 -0400
+
 juno-kde-fancontrol (0.6.3+diamon5) unstable; urgency=medium
 
   * One nvidia-smi in flight. With the NVIDIA driver wedged in the kernel
