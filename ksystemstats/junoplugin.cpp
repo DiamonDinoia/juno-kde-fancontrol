@@ -80,6 +80,13 @@ class JunoSensorsPrivate
 {
 public:
     JunoSensorsPrivate(JunoSensorsPlugin *qq);
+    ~JunoSensorsPrivate()
+    {
+        // ~QProcess kills and then waits 30 s; a child in D state never dies.
+        // ponytail: a running child is leaked, only on plugin unload.
+        if (dgpuSmi->state() == QProcess::NotRunning)
+            delete dgpuSmi;
+    }
 
     void update();
 
@@ -124,6 +131,7 @@ public:
     KSysGuard::SensorProperty *dgpuState = nullptr;
     KSysGuard::SensorProperty *dgpuActiveGpu = nullptr;
     QElapsedTimer dgpuSmiClock;
+    QProcess *dgpuSmi = new QProcess; // heap: see ~JunoSensorsPrivate
     DgpuReading dgpuCached;
 
     // network
@@ -346,15 +354,14 @@ void JunoSensorsPrivate::update()
         r.active = (runtime == QLatin1String("active"));
         r.state = r.active ? i18nc("@info GPU state", "active") : powerState.isEmpty() ? runtime : powerState;
         if (r.active) {
-            // nvidia-smi at most once every 2 s even though update() fires ~2 Hz.
-            if (!dgpuSmiClock.isValid() || dgpuSmiClock.elapsed() >= 2000) {
-                QProcess p;
-                p.start(nvidiaSmi,
-                        {QStringLiteral("--query-gpu=temperature.gpu,utilization.gpu,power.draw,memory.used"),
-                         QStringLiteral("--format=csv,noheader,nounits")});
-                p.waitForFinished(2000);
-                const QString out = QString::fromLocal8Bit(p.readAllStandardOutput()).trimmed();
-                if (p.exitStatus() == QProcess::NormalExit && !out.isEmpty()) {
+            // One nvidia-smi in flight, started asynchronously and read on a later
+            // tick. A driver wedged in the kernel leaves the child in D state where
+            // SIGKILL does nothing: a per-tick QProcess piled up 76 of them and its
+            // destructor blocked update() for 30 s each time.
+            const bool busy = dgpuSmi->state() != QProcess::NotRunning && !dgpuSmi->waitForFinished(0);
+            if (!busy) {
+                const QString out = QString::fromLocal8Bit(dgpuSmi->readAllStandardOutput()).trimmed();
+                if (dgpuSmi->exitStatus() == QProcess::NormalExit && dgpuSmi->exitCode() == 0 && !out.isEmpty()) {
                     const QStringList f = out.split(QLatin1Char(','));
                     if (f.size() >= 4) {
                         dgpuCached.tempC = f[0].trimmed().toDouble();
@@ -365,18 +372,32 @@ void JunoSensorsPrivate::update()
                         dgpuCached.active = true;
                     }
                 }
-                dgpuSmiClock.start();
+                // nvidia-smi at most once every 2 s even though update() fires ~2 Hz.
+                if (!dgpuSmiClock.isValid() || dgpuSmiClock.elapsed() >= 2000) {
+                    dgpuSmi->start(nvidiaSmi,
+                                  {QStringLiteral("--query-gpu=temperature.gpu,utilization.gpu,power.draw,memory.used"),
+                                   QStringLiteral("--format=csv,noheader,nounits")});
+                    dgpuSmiClock.start();
+                }
+            } else if (dgpuSmiClock.elapsed() >= 2000) {
+                // A healthy nvidia-smi answers well inside one 2 s slot: the cached
+                // reading is stale, and the state says why the fields are blank.
+                dgpuCached = DgpuReading{};
+                dgpuCached.present = true;
+                r.state = i18nc("@info GPU state", "active, nvidia-smi unavailable");
             }
-            dgpuTemp->setValue(dgpuCached.tempC);
-            dgpuBusy->setValue(dgpuCached.utilPct);
-            dgpuMemory->setValue(dgpuCached.memoryMiB);
-            dgpuPower->setValue(dgpuCached.powerW);
         } else {
             // Suspended: the state text replaces the invented temperature.
             dgpuCached = DgpuReading{};
             dgpuCached.present = true;
             dgpuSmiClock.invalidate();
         }
+        // No reading (suspended, first tick, hung child) publishes unset, never 0.
+        const bool have = dgpuCached.active;
+        dgpuTemp->setValue(have ? QVariant(dgpuCached.tempC) : QVariant());
+        dgpuBusy->setValue(have ? QVariant(dgpuCached.utilPct) : QVariant());
+        dgpuMemory->setValue(have ? QVariant(dgpuCached.memoryMiB) : QVariant());
+        dgpuPower->setValue(have ? QVariant(dgpuCached.powerW) : QVariant());
         dgpuState->setValue(r.state.isEmpty() ? (r.active ? i18nc("@info", "active") : i18nc("@info", "suspended")) : r.state);
         dgpuActiveGpu->setValue(r.active ? i18nc("@info", "dGPU") : i18nc("@info", "iGPU"));
     }

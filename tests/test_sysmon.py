@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
+import time
 from pathlib import Path
 
 import pytest
+
+from backend import sysmon
 from backend.sysmon import (Battery, Sampler, fmt_duration, fmt_rate, read_battery,
                             read_cpu_jiffies, read_dgpu, read_igpu_freq_mhz,
                             read_net_bytes, read_rapl_uj, read_rc6_ms)
@@ -341,3 +345,54 @@ def test_the_panel_rethemes_when_the_scheme_changes(tmp_path: Path) -> None:
     finally:
         traymod.ktheme.kdeglobals = orig
         traymod.ktheme.scheme.cache_clear()
+
+
+def fake_proc(tmp_path: Path, state: str) -> str:
+    proc = tmp_path / "proc"
+    (proc / "4242").mkdir(parents=True)
+    (proc / "4242" / "stat").write_text(f"4242 (nvidia-smi) {state} 1 4242 4242 0 -1 4194560 0\n")
+    (proc / "self").mkdir()                      # non-numeric entries are skipped
+    return str(proc)
+
+
+def hanging_smi(tmp_path: Path) -> tuple[str, Path]:
+    # exec keeps the pid: the test kills the sleeper by that pid at the end.
+    pidfile = tmp_path / "smi.pid"
+    smi = tmp_path / "nvidia-smi"
+    smi.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nexec sleep 30\n")
+    smi.chmod(0o755)
+    return str(smi), pidfile
+
+
+def test_smi_hung_only_on_state_d(tmp_path: Path) -> None:
+    assert sysmon.smi_hung(fake_proc(tmp_path / "d", "D"))
+    assert not sysmon.smi_hung(fake_proc(tmp_path / "s", "S"))   # discrimination: S must not count
+
+
+def test_dgpu_skips_smi_while_one_is_stuck(tmp_path: Path, monkeypatch) -> None:
+    # 76 D-state nvidia-smi children in one session: a wedged driver keeps every
+    # child; the reader must not add another.
+    root = make_tree(tmp_path / "t")
+    marker = tmp_path / "smi-ran"
+    smi = tmp_path / "nvidia-smi"
+    smi.write_text(f"#!/bin/sh\ntouch {marker}\necho '50, 10, 9.0, 100'\n")
+    smi.chmod(0o755)
+    monkeypatch.setattr(sysmon, "DEFAULT_PROC", fake_proc(tmp_path, "D"))
+    d = read_dgpu(str(root / "dgpu"), str(smi))
+    assert (d.present, d.powered, d.temp_c) == (True, True, None)
+    assert not marker.exists()
+
+
+def test_dgpu_smi_timeout_returns_without_waiting(tmp_path: Path, monkeypatch) -> None:
+    root = make_tree(tmp_path / "t")
+    smi, pidfile = hanging_smi(tmp_path)
+    monkeypatch.setattr(sysmon, "SMI_TIMEOUT_S", 0.2)
+    t0 = time.monotonic()
+    d = read_dgpu(str(root / "dgpu"), smi)
+    elapsed = time.monotonic() - t0
+    try:
+        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+    except ProcessLookupError:
+        pass                                   # read_dgpu's own kill() already landed
+    assert (d.present, d.powered, d.temp_c) == (True, True, None)
+    assert elapsed < 2, f"read_dgpu blocked {elapsed:.1f}s on a hung nvidia-smi"

@@ -23,13 +23,15 @@ DEFAULT_DGPU_PCI = "/sys/bus/pci/devices/0000:01:00.0"
 DEFAULT_POWER_SUPPLY = "/sys/class/power_supply"
 DEFAULT_RAPL = "/sys/class/powercap/intel-rapl:1"  # psys: whole-platform domain
 DEFAULT_NET_CLASS = "/sys/class/net"
+DEFAULT_PROC = "/proc"
+SMI_TIMEOUT_S = 5
 
 
 def _read(path: str) -> str | None:
     try:
         with open(path, encoding="ascii") as f:
             return f.read().strip()
-    except OSError:
+    except (OSError, ValueError):  # ValueError: non-ASCII bytes, e.g. a comm in /proc/*/stat
         return None
 
 
@@ -86,10 +88,30 @@ class Dgpu:
     memory_mb: int | None = None
 
 
+def smi_hung(proc_dir: str | None = None) -> bool:
+    """True when some nvidia-smi sits in uninterruptible sleep (state D). The
+    driver is then wedged in the kernel and a new child would only join the
+    pile: one session collected 76 of them, none killable."""
+    proc_dir = DEFAULT_PROC if proc_dir is None else proc_dir  # read late: tests repoint it
+    for pid in os.listdir(proc_dir):
+        if not pid.isdigit():
+            continue
+        stat = _read(os.path.join(proc_dir, pid, "stat"))
+        if stat is None or "(nvidia-smi)" not in stat:
+            continue
+        if stat[stat.rindex(")") + 2] == "D":
+            return True
+    return False
+
+
 def read_dgpu(pci_dir: str = DEFAULT_DGPU_PCI, nvidia_smi: str = "nvidia-smi") -> Dgpu:
     """Read the runtime PM state from sysfs FIRST and only run nvidia-smi when
     the device is already awake. Querying a suspended GPU resumes it, which
     costs about 10 W and defeats the purpose of asking whether it is off.
+
+    A hung nvidia-smi is abandoned after SMI_TIMEOUT_S without waiting for it:
+    a child stuck in the driver ignores SIGKILL, and wait() would block the
+    caller with it.
     """
     if not os.path.isdir(pci_dir):
         return Dgpu(present=False, powered=False, state="absent")
@@ -98,15 +120,23 @@ def read_dgpu(pci_dir: str = DEFAULT_DGPU_PCI, nvidia_smi: str = "nvidia-smi") -
     if runtime != "active":
         return Dgpu(present=True, powered=False, state=f"{runtime} ({power_state})".strip())
 
+    awake = Dgpu(present=True, powered=True, state=power_state or "active")
+    if smi_hung():
+        return awake
     fields = "temperature.gpu,utilization.gpu,power.draw,memory.used"
     try:
-        out = subprocess.run([nvidia_smi, f"--query-gpu={fields}",
-                              "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return Dgpu(present=True, powered=True, state=power_state or "active")
-    if out.returncode != 0 or not out.stdout.strip():
-        return Dgpu(present=True, powered=True, state=power_state or "active")
+        proc = subprocess.Popen([nvidia_smi, f"--query-gpu={fields}",
+                                 "--format=csv,noheader,nounits"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return awake
+    try:
+        stdout, _ = proc.communicate(timeout=SMI_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return awake
+    if proc.returncode != 0 or not stdout.strip():
+        return awake
 
     def num(raw: str, cast):
         raw = raw.strip()
@@ -115,7 +145,7 @@ def read_dgpu(pci_dir: str = DEFAULT_DGPU_PCI, nvidia_smi: str = "nvidia-smi") -
         except ValueError:
             return None
 
-    parts = out.stdout.strip().splitlines()[0].split(",")
+    parts = stdout.strip().splitlines()[0].split(",")
     parts += [""] * (4 - len(parts))
     return Dgpu(present=True, powered=True, state=power_state or "active",
                 temp_c=num(parts[0], lambda v: int(float(v))),

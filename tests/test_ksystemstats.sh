@@ -144,6 +144,24 @@ dgpu_temp_blank=$(sed -n 's|juno/dgpu/temperature = ||p' <<<"$OUT")
 [[ "$dgpu_temp_blank" == "unset" || -z "$dgpu_temp_blank" ]] \
     && ok no-fake-temp || bad no-fake-temp "printed '$dgpu_temp_blank'"
 
+# --- nvidia-smi that never returns: one child, no blocking --------------------
+echo active > "$R/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
+echo D0 > "$R/sys/bus/pci/devices/0000:01:00.0/power_state"
+: > "$R/smi.log"
+printf '#!/bin/bash\necho "$*" >> "%s"\necho $$ > "%s"\nexec sleep 60\n' "$R/smi.log" "$R/smi.pid" > "$R/nvidia-smi"
+chmod 755 "$R/nvidia-smi"
+t0=$SECONDS
+OUT=$(run_probe "$R" 6)
+hang_s=$((SECONDS - t0))
+kill -9 "$(cat "$R/smi.pid")" 2>/dev/null
+[[ $(wc -l < "$R/smi.log") -eq 1 ]] && ok smi-single-flight || bad smi-single-flight "$(wc -l < "$R/smi.log") starts"
+# 6 ticks x 650 ms = 3.9 s; pre-fix 30 s per tick. 15 s: no false fail on a loaded CI runner
+[[ $hang_s -lt 15 ]] && ok smi-hang-nonblocking || bad smi-hang-nonblocking "6 ticks took ${hang_s}s"
+grep -q 'juno/dgpu/state = active, nvidia-smi unavailable' <<<"$OUT" && ok smi-hang-state \
+    || bad smi-hang-state "$(grep 'state =' <<<"$OUT")"
+[[ $(sed -n 's|juno/dgpu/temperature = ||p' <<<"$OUT") == unset ]] && ok smi-hang-temp-unset \
+    || bad smi-hang-temp-unset "$(grep 'dgpu/temp' <<<"$OUT")"
+
 # --- no card at all -----------------------------------------------------------
 R2=$(mktemp -d)
 python3 - "$R2" "$SRC/tests" <<'PYEOF'
