@@ -318,6 +318,10 @@ grep -qx 'StartLimitIntervalSec=180' "$DROPIN" && ok dropin-startlimit-interval 
     || bad dropin-startlimit-interval "$(cat "$DROPIN")"
 grep -qx 'StartLimitBurst=3' "$DROPIN" && ok dropin-startlimit-burst \
     || bad dropin-startlimit-burst "$(cat "$DROPIN")"
+# PrivateDevices=yes upstream hides /dev/nvidia* from the !juno-gpu-temp
+# FCTEMPS source, so the GPU fan would follow coretemp instead of the dGPU
+grep -qx 'PrivateDevices=no' "$DROPIN" && ok dropin-devices-visible \
+    || bad dropin-devices-visible "$(grep PrivateDevices "$DROPIN")"
 # the ExecStartPre must name a path the package really ships, or the boot-time
 # hwmon resync silently never runs
 regen=$(sed -n 's/^ExecStartPre=\(.*\) regen$/\1/p' "$DROPIN")
