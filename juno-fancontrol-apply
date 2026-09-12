@@ -321,6 +321,9 @@ restore() {
 if [[ "${NO_RESTART:-0}" != "1" ]]; then
     "$SYSTEMCTL" disable --now clevofan-auto.service >/dev/null 2>&1 || true
     "$SYSTEMCTL" enable fancontrol.service >/dev/null 2>&1 || true
+    # The drop-in caps crash loops at 3 starts per 180 s; neither the restart
+    # below nor the `start` in restore() may be refused by that cap.
+    "$SYSTEMCTL" reset-failed fancontrol.service >/dev/null 2>&1 || true
     if "$SYSTEMCTL" is-active --quiet fancontrol.service && cfg_eq "$TMP" "$FANCONFIG"; then
         rm -f "$TMP"
         trap - EXIT

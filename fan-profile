@@ -228,6 +228,9 @@ apply_fancontrol() {
         return
     fi
     mv "$tmp" "$FANCONFIG"
+    # The drop-in caps crash loops at 3 starts per 180 s; an explicit profile
+    # switch after a few quick restarts must not be refused by that cap.
+    systemctl reset-failed fancontrol.service 2>/dev/null || true
     systemctl restart fancontrol.service
 }
 

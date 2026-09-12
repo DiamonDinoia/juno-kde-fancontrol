@@ -146,6 +146,9 @@ else
     bad T1-regen-keeps-clamp "$(diff -u <(tail -n +2 "$ROOT/ref.txt") <(tail -n +2 "$ROOT/etc/fancontrol") 2>&1 | head -20)"
 fi
 grep -q "restart fancontrol.service" "$ROOT/state/systemctl.log" && ok T1-restarted || bad T1-restarted ""
+# an explicit apply resets the crash-loop start counter before it restarts
+[[ $(grep -E '^(reset-failed|restart) fancontrol.service$' "$ROOT/state/systemctl.log" | tr '\n' ' ') == "reset-failed fancontrol.service restart fancontrol.service " ]] \
+    && ok T1-reset-failed-before-restart || bad T1-reset-failed-before-restart "$(cat "$ROOT/state/systemctl.log")"
 grep -q "enable fancontrol.service"  "$ROOT/state/systemctl.log" && ok T1-enabled   || bad T1-enabled ""
 grep -q "clamping MAXPWM 255 -> 150" <<< "$out" && ok T1-clamp-msg || bad T1-clamp-msg "$out"
 
@@ -170,6 +173,9 @@ reset_state
 FAKE_FANCONTROL_FAIL=1 "$APPLY" 10 55 90 60 45 40 100 4 balanced >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 ]] && ok T4-check-fails || bad T4-check-fails "rc=0"
 grep -q "weird" "$ROOT/etc/fancontrol" && ok T4-restored || bad T4-restored "$(head -1 "$ROOT/etc/fancontrol")"
+# restore() starts the daemon; the start-limit reset must precede it too
+[[ $(grep -E '^(reset-failed|start) fancontrol.service$' "$ROOT/state/systemctl.log" | tr '\n' ' ') == "reset-failed fancontrol.service start fancontrol.service " ]] \
+    && ok T4-reset-failed-before-restore-start || bad T4-reset-failed-before-restore-start "$(cat "$ROOT/state/systemctl.log")"
 
 # T5: --auto delegates to fan-profile
 reset_state
@@ -758,6 +764,12 @@ FP_NOW="2026-09-05 09:09" PATH="$ROOT/bin:$PATH" "$ROOT/bin/fpwrap" quiet >/dev/
 FP_NOW="2026-09-05 09:10" PATH="$ROOT/bin:$PATH" "$ROOT/bin/fpwrap" quiet >/dev/null 2>&1
 [[ "$(restarts)" == 0 ]] && ok T23-cli-next-minute-no-restart \
     || bad T23-cli-next-minute-no-restart "$(cat "$ROOT/state/systemctl.log")"
+
+# the CLI path resets the crash-loop start counter before its restart too
+: > "$ROOT/state/systemctl.log"
+PATH="$ROOT/bin:$PATH" "$ROOT/bin/fpwrap" cool >/dev/null 2>&1
+[[ $(grep -E '^(reset-failed|restart) fancontrol.service$' "$ROOT/state/systemctl.log" | tr '\n' ' ') == "reset-failed fancontrol.service restart fancontrol.service " ]] \
+    && ok T23-cli-reset-failed-before-restart || bad T23-cli-reset-failed-before-restart "$(cat "$ROOT/state/systemctl.log")"
 
 # a changed curve must restart, exactly once
 : > "$ROOT/state/systemctl.log"

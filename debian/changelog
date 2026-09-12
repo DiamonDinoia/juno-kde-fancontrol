@@ -1,3 +1,25 @@
+juno-kde-fancontrol (0.6.3+diamon5) unstable; urgency=medium
+
+  * One nvidia-smi in flight. With the NVIDIA driver wedged in the kernel
+    (610.57.04, nvidia-smi stuck in D state at os_acquire_rwlock_write) the
+    ksystemstats plugin blocked 30 s per tick in ~QProcess and left one
+    unkillable child per 32 s: 76 processes after 40 min. The plugin now
+    keeps one asynchronous QProcess on the heap, skips the tick while the
+    child runs, and after 2 s without an answer publishes the dGPU fields
+    as unset with state "active, nvidia-smi unavailable" instead of 0.
+    read_dgpu skips nvidia-smi while any nvidia-smi sits in state D and
+    abandons a timed-out child without wait(), so juno-gpu-temp and the tray
+    fall back to coretemp instead of hanging with the driver.
+  * fancontrol drop-in: PrivateDevices=no. The stock unit hides /dev/nvidia*
+    from the !juno-gpu-temp FCTEMPS source, so nvidia-smi failed and the GPU
+    fan followed coretemp (pwm2 == pwm1 at a 57 C GPU with MINTEMP 60).
+  * juno-fancontrol-apply and fan-profile run systemctl reset-failed before
+    the restart: the drop-in's StartLimitBurst=3/180 s refused an explicit
+    apply after three quick restarts and left fancontrol down (fans on EC
+    auto), with the config rolled back.
+
+ -- Marco Barbone <mbarbone@flatironinstitute.org>  Sat, 12 Sep 2026 10:29:25 -0400
+
 juno-kde-fancontrol (0.6.3+diamon4) unstable; urgency=low
 
   * Depends: juno-drivers-diamon. Closes the 4-way Juno Depends cycle together

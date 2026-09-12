@@ -50,6 +50,7 @@ syslane() {  # -> space-separated failed static systemd/packaging checks (host-s
     grep -q '^Restart=always' systemd/30-juno-fancontrol.conf && s+="dropin-restart-always "
     grep -qx 'StartLimitIntervalSec=180' systemd/30-juno-fancontrol.conf || s+="dropin-startlimit-interval "
     grep -qx 'StartLimitBurst=3' systemd/30-juno-fancontrol.conf || s+="dropin-startlimit-burst "
+    grep -qx 'PrivateDevices=no' systemd/30-juno-fancontrol.conf || s+="dropin-devices-hidden "
     grep -q 'systemd/fancontrol-sleep-noop' debian/install || s+="noop-not-shipped "
     ! grep -q 'systemd/fancontrol-resume' debian/install || s+="resume-hook-still-installed "
     grep -q 'dpkg-divert --package juno-kde-fancontrol --add' debian/postinst || s+="divert-missing "
@@ -316,6 +317,14 @@ mutate M45-startlimit-dropped systemd/30-juno-fancontrol.conf \
     '/^StartLimitBurst=3$/d'
 mutate M57-startlimit-interval-dropped systemd/30-juno-fancontrol.conf \
     '/^StartLimitIntervalSec=180$/d'
+mutate M63-private-devices-back systemd/30-juno-fancontrol.conf \
+    '/^PrivateDevices=no$/d'
+# An explicit apply or profile switch must reset the crash-loop start counter
+# first, or StartLimitBurst=3 refuses it and leaves fancontrol down.
+mutate M64-apply-no-reset-failed juno-fancontrol-apply \
+    '/reset-failed fancontrol.service/d'
+mutate M65-profile-no-reset-failed fan-profile \
+    '/reset-failed fancontrol.service/d'
 # Packaging: the no-op hook must ship, the old resume hook must not come back,
 # and the diversion must be addable, removable and warned about.
 mutate M46-noop-not-shipped debian/install \
